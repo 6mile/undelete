@@ -38,7 +38,7 @@ function showBanner() {
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  NPM Package Recovery Tool v1.0
- Accessing mirror networks...
+ Created by 6mile - github.com/6mile
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `);
 }
@@ -52,6 +52,7 @@ function showHelp() {
 \\__,_/_/ /_/\\__,_/\\___/_/\\___/\\__/\\___/
 
 NPM Package Recovery Tool v1.0
+Created by 6mile - github.com/6mile
 
 USAGE:
   node undelete.js <package-name> [options]

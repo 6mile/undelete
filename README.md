@@ -3,7 +3,7 @@
 # undelete
 
 This package "undeletes" a package that has been deleted from the NPM registry.  How does it do that?
-Well, magic of course!  No, no ... on the serious tip, the undelete function works by going to secondary
+Well, magic of course!  No, no ... on the serious tip, the undelete function works by checking secondary
 NPM mirrors and pulling the files from their cache. This package will also undelete the package metadata
 which will tell you the NPM user, email and other metadata that's helpful for research purposes.
 
