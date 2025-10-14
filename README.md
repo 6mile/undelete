@@ -1,15 +1,15 @@
+![undelete](./images/undelete-banner-logo.png)
+
 # undelete
 
-![undelete](./images/undelete-logo.jpg)
-
-This package "undeletes" a package that has been deleted from the NPM registry.  How does it doe that?
+This package "undeletes" a package that has been deleted from the NPM registry.  How does it do that?
 Well, magic of course!  No, no ... on the serious tip, the undelete function works by going to secondary
-NPM mirrors and downloading from them.
+NPM mirrors and pulling the files from their cache.
 
 ## Usage
 
 ```bash
-node undelete.js <package-name> [options]
+undelete <package-name> [options]
 ```
 
 ### Options
@@ -28,10 +28,10 @@ npm undelete
 ### Examples
 
 ```bash
-node undelete.js express
-node undelete.js @angular/core -n 10
-node undelete.js lodash --path ./downloads
-node undelete.js react -p /tmp/packages -n 15 -s
+undelete express
+undelete @angular/core -n 10
+undelete lodash --path ./downloads
+undelete react -p /tmp/packages -n 15 -s
 ```
 
 ## Features
