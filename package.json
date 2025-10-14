@@ -1,0 +1,27 @@
+{
+  "name": "undelete",
+  "version": "1.1.0",
+  "description": "undeletes packages that have been removed from the NPM registry",
+  "keywords": [
+    "undelete"
+  ],
+  "homepage": "https://github.com/6mile/undelete#readme",
+  "bugs": {
+    "url": "https://github.com/6mile/undelete/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/6mile/undelete.git"
+  },
+  "license": "MIT",
+  "author": "6mile",
+  "bin": "./undelete.js",
+  "type": "commonjs",
+  "main": "undelete.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "undelete": "^1.1.0"
+  }
+}

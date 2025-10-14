@@ -5,6 +5,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const { exec } = require('child_process');
+const util = require('util');
+
+const execPromise = util.promisify(exec);
 
 const REGISTRIES = [
     "https://registry.npmjs.org/",
@@ -58,6 +62,9 @@ OPTIONS:
   -p, --path <directory>    Save downloaded packages to specified directory
                             (default: current directory)
   
+  -d, --data                Get package metadata (NPM user and email) instead
+                            of downloading files
+  
   -s, --silent              Run in silent mode with no output
   
   -h, --help                Display this help message
@@ -67,6 +74,7 @@ EXAMPLES:
   node undelete.js @angular/core -n 10
   node undelete.js lodash --path ./downloads
   node undelete.js react -p /tmp/packages -n 15 -s
+  node undelete.js express --data
 
 DESCRIPTION:
   Downloads the most recent versions of any NPM package from multiple
@@ -294,15 +302,160 @@ function performDownload(url, packageName, version, outputPath) {
     });
 }
 
+async function getPackageMetadata(registry, packageName, isTencent = false) {
+    const maxAttempts = isTencent ? 10 : 1;
+    
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (isTencent && attempt > 1) {
+                log(`  [Tencent] Retry attempt ${attempt}/${maxAttempts}...`);
+            }
+            
+            const registryUrl = registry.replace(/\/$/, '');
+            const { stdout } = await execPromise(
+                `npm view ${packageName} --json --registry ${registryUrl} 2>/dev/null`,
+                { timeout: 30000 }
+            );
+            
+            if (!stdout) {
+                throw new Error('No output from npm view');
+            }
+            
+            const data = JSON.parse(stdout);
+            
+            // Parse _npmUser which can be a string like "name <email>" or an object
+            let npmUser = null;
+            if (data._npmUser) {
+                if (typeof data._npmUser === 'string') {
+                    const match = data._npmUser.match(/^(.+?)\s*<(.+?)>$/);
+                    if (match) {
+                        npmUser = { name: match[1].trim(), email: match[2].trim() };
+                    } else {
+                        npmUser = { name: data._npmUser, email: null };
+                    }
+                } else if (typeof data._npmUser === 'object') {
+                    npmUser = data._npmUser;
+                }
+            }
+            
+            return {
+                name: data.name,
+                version: data.version,
+                description: data.description || '',
+                npmUser: npmUser,
+                maintainers: data.maintainers || [],
+                author: data.author || {}
+            };
+        } catch (e) {
+            if (isTencent && attempt < maxAttempts) {
+                log(`  [Tencent] Attempt ${attempt}/${maxAttempts} failed`);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            } else if (attempt >= maxAttempts) {
+                log(`  Package not found in this registry`);
+                return null;
+            }
+        }
+    }
+    
+    return null;
+}
+
+async function displayPackageData(packageName) {
+    showBanner();
+    
+    log(`Fetching package metadata for: ${packageName}\n`);
+    
+    for (const registry of REGISTRIES) {
+        log(`Checking ${registry}...`);
+        
+        const isTencent = registry.includes('tencent.com');
+        const metadata = await getPackageMetadata(registry, packageName, isTencent);
+        
+        if (!metadata) {
+            continue;
+        }
+        
+        if (metadata.version && metadata.version.endsWith('0.0.1-security')) {
+            log(`  Skipping security placeholder version: ${metadata.version}\n`);
+            continue;
+        }
+        
+        const hasSecurityEmail = (email) => email && email === 'npm@npmjs.com';
+        
+        const npmUserHasSecurityEmail = hasSecurityEmail(metadata.npmUser?.email);
+        const authorHasSecurityEmail = hasSecurityEmail(metadata.author?.email);
+        const allMaintainersHaveSecurityEmail = Array.isArray(metadata.maintainers) && 
+            metadata.maintainers.length > 0 &&
+            metadata.maintainers.every(m => hasSecurityEmail(m.email));
+        
+        if (npmUserHasSecurityEmail || authorHasSecurityEmail || allMaintainersHaveSecurityEmail) {
+            log(`  Skipping package with security placeholder email\n`);
+            continue;
+        }
+        
+        if (SILENT_MODE) {
+            const jsonOutput = {
+                package: metadata.name,
+                version: metadata.version,
+                description: metadata.description,
+                npmUser: metadata.npmUser?.name || null,
+                npmUserEmail: metadata.npmUser?.email || null,
+                maintainers: metadata.maintainers || []
+            };
+            console.log(JSON.stringify(jsonOutput, null, 2));
+            process.exit(0);
+        }
+        
+        log(`\nPackage: ${metadata.name}`);
+        log(`Version: ${metadata.version}`);
+        if (metadata.description) {
+            log(`Description: ${metadata.description}`);
+        }
+        log('');
+        
+        if (metadata.npmUser && Object.keys(metadata.npmUser).length > 0) {
+            log(`NPM User:`);
+            if (metadata.npmUser.name) log(`  Name: ${metadata.npmUser.name}`);
+            if (metadata.npmUser.email) log(`  Email: ${metadata.npmUser.email}`);
+            log('');
+        }
+        
+        if (metadata.author && Object.keys(metadata.author).length > 0) {
+            log(`Author:`);
+            if (metadata.author.name) log(`  Name: ${metadata.author.name}`);
+            if (metadata.author.email) log(`  Email: ${metadata.author.email}`);
+            log('');
+        }
+        
+        if (Array.isArray(metadata.maintainers) && metadata.maintainers.length > 0) {
+            log(`Maintainers:`);
+            metadata.maintainers.forEach((maintainer, index) => {
+                log(`  ${index + 1}. ${maintainer.name || 'N/A'}`);
+                if (maintainer.email) log(`     Email: ${maintainer.email}`);
+            });
+            log('');
+        }
+        
+        log(`Data retrieved from: ${registry}`);
+        process.exit(0);
+    }
+    
+    log("\nFailed to retrieve package metadata from any registry");
+    process.exit(1);
+}
+
 async function main() {
     const args = process.argv.slice(2);
     let packageName = null;
     let outputPath = process.cwd();
     let versionCount = 5;
+    let dataMode = false;
 
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help' || args[i] === '-h') {
             showHelp();
+        } else if (args[i] === '--data' || args[i] === '-d') {
+            dataMode = true;
         } else if (args[i] === '--number' || args[i] === '-n') {
             if (i + 1 < args.length) {
                 const count = parseInt(args[i + 1]);
@@ -332,9 +485,14 @@ async function main() {
     }
 
     if (!packageName) {
-        console.log("Usage: node undelete.js <package-name> [--number|-n <count>] [--path|-p <directory>] [--silent|-s]");
+        console.log("Usage: node undelete.js <package-name> [--number|-n <count>] [--path|-p <directory>] [--data|-d] [--silent|-s]");
         console.log("Try 'node undelete.js --help' for more information.");
         process.exit(1);
+    }
+
+    if (dataMode) {
+        await displayPackageData(packageName);
+        return;
     }
 
     if (!fs.existsSync(outputPath)) {
