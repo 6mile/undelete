@@ -37,7 +37,7 @@ function showBanner() {
 \\__,_/_/ /_/\\__,_/\\___/_/\\___/\\__/\\___/
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- NPM Package Recovery Tool v1.1.2
+ NPM Package Recovery Tool v1.1.3
  Created by 6mile - github.com/6mile
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `);
@@ -51,7 +51,7 @@ function showHelp() {
 / /_/ / / / / /_/ /  __/ /  __/ /_/  __/
 \\__,_/_/ /_/\\__,_/\\___/_/\\___/\\__/\\___/
 
-NPM Package Recovery Tool v1.0
+NPM Package Recovery Tool v1.1.3
 Created by 6mile - github.com/6mile
 
 USAGE:
