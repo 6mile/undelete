@@ -7,10 +7,16 @@ Well, magic of course!  No, no ... on the serious tip, the undelete function wor
 NPM mirrors and pulling the files from their cache. This package will also undelete the package metadata
 which will tell you the NPM user, email and other metadata that's helpful for research purposes.
 
+## How to install
+
+```bash
+npm install undelete
+```
+
 ## Usage
 
 ```bash
-node ./undelete.js <package-name> [options]
+undelete <package-name> [options]
 ```
 
 ### Options
@@ -19,29 +25,29 @@ node ./undelete.js <package-name> [options]
 - `-p, --path <directory>` - Save packages to specified directory (default: current directory)
 - `-d, --data` - Get package metadata (NPM user, email, description) instead of downloading
 - `-s, --silent` - Run in silent mode with no output (JSON output when combined with `-d`)
-- `-v, --version` - Show version of undelete
+- `-v, --version` - Show the version of undelete
 - `-h, --help` - Display help message
 
 ### Examples
 
 ```bash
 # Download 5 most recent versions (default)
-node undelete.js express
+undelete express
 
 # Download 10 versions
-node undelete.js @angular/core -n 10
+undelete @angular/core -n 10
 
 # Download to specific directory
-node undelete.js lodash --path ./downloads
+undelete lodash --path ./downloads
 
 # Get package metadata
-node undelete.js express --data
+undelete express --data
 
 # Get metadata as JSON (silent mode) # GREAT FOR SCRIPTING
-node undelete.js react -d -s
+undelete react -d -s
 
 # Combine options
-node undelete.js react -p /tmp/packages -n 15 -s
+undelete react -p /tmp/packages -n 15 -s
 ```
 
 ## Features
@@ -69,15 +75,15 @@ Normal mode displays formatted package information. Silent mode (`-d -s`) output
 
 ```json
 {
-  "package": "fake-tokens",
-  "version": "0.1.11",
-  "description": "Generate fake access tokens",
-  "npmUser": "6mile",
-  "npmUserEmail": "6mile@linux.com",
+  "package": "express",
+  "version": "4.18.2",
+  "description": "Fast, unopinionated, minimalist web framework",
+  "npmUser": "dougwilson",
+  "npmUserEmail": "doug@somethingdoug.com",
   "maintainers": [
     {
-      "name": "6mile",
-      "email": "6mile@linux.com"
+      "name": "dougwilson",
+      "email": "doug@somethingdoug.com"
     }
   ]
 }

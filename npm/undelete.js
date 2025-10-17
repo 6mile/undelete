@@ -57,7 +57,7 @@ NPM Package Recovery Tool v${VERSION}
 Created by 6mile - github.com/6mile
 
 USAGE:
-  node undelete.js <package-name> [options]
+  undelete <package-name> [options]
 
 OPTIONS:
   -n, --number <count>      Number of versions to download (1-20, default: 5)
@@ -75,11 +75,11 @@ OPTIONS:
   -v, --version             Show the version of undelete
 
 EXAMPLES:
-  node undelete.js express
-  node undelete.js @angular/core -n 10
-  node undelete.js lodash --path ./downloads
-  node undelete.js react -p /tmp/packages -n 15 -s
-  node undelete.js express --data
+  undelete express
+  undelete @angular/core -n 10
+  undelete lodash --path ./downloads
+  undelete react -p /tmp/packages -n 15 -s
+  undelete express --data
 
 DESCRIPTION:
   Downloads the most recent versions of any NPM package from multiple
@@ -495,8 +495,8 @@ async function main() {
     }
 
     if (!packageName) {
-        console.log("Usage: node undelete.js <package-name> [--number|-n <count>] [--path|-p <directory>] [--data|-d] [--silent|-s]");
-        console.log("Try 'node undelete.js --help' for more information.");
+        console.log("Usage: undelete <package-name> [--number|-n <count>] [--path|-p <directory>] [--data|-d] [--silent|-s]");
+        console.log("Try 'undelete --help' for more information.");
         process.exit(1);
     }
 
