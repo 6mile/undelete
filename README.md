@@ -2,95 +2,136 @@
 
 # undelete
 
+```
+                   __     __     __     
+  __  ______  ____/ /__  / /__  / /____ 
+ / / / / __ \/ __  / _ \/ / _ \/ __/ _ \
+/ /_/ / / / / /_/ /  __/ /  __/ /_/  __/
+\__,_/_/ /_/\__,_/\___/_/\___/\__/\___/
+```
+
 This package "undeletes" a package that has been deleted from the NPM registry.  How does it do that?
 Well, magic of course!  No, no ... on the serious tip, the undelete function works by checking secondary
 NPM mirrors and pulling the files from their cache. This package will also undelete the package metadata
 which will tell you the NPM user, email and other metadata that's helpful for research purposes.
 
+## Overview
+
+When packages are removed from NPM or PyPI (often due to malware detection), they become unavailable through normal channels. This tool recovers those packages by:
+
+- **NPM**: Querying Chinese mirror servers (cnpmjs, npmmirror, Huawei, Tencent) that may still have cached copies
+- **PyPI**: Using [ecosyste.ms](https://ecosyste.ms) which indexes `files.pythonhosted.org` URLs that often remain accessible
+
+This is particularly useful for security researchers analyzing malicious packages that have been taken down.
+
+## How to install
+
+```bash
+npm install undelete
+```
+
 ## Usage
 
 ```bash
-node ./undelete.js <package-name> [options]
+undelete <registry> <package-name> [options]
 ```
+
+Requires Node.js 14+.
+
+## Usage
+
+```bash
+undelete <registry> <package-name> [options]
+```
+
+### Registries
+
+| Registry | Description |
+|----------|-------------|
+| `npm` | NPM (npmjs.org) packages |
+| `pypi` | PyPI (pypi.org) Python packages |
 
 ### Options
 
-- `-n, --number <count>` - Number of versions to download (1-20, default: 5)
-- `-p, --path <directory>` - Save packages to specified directory (default: current directory)
-- `-d, --data` - Get package metadata (NPM user, email, description) instead of downloading
-- `-s, --silent` - Run in silent mode with no output (JSON output when combined with `-d`)
-- `-v, --version` - Show version of undelete
-- `-h, --help` - Display help message
+| Option | Description |
+|--------|-------------|
+| `-n, --number <count>` | Number of versions to download (1-20, default: 5) |
+| `-p, --path <directory>` | Save downloaded packages to specified directory (default: current directory) |
+| `-d, --data` | Get package metadata instead of downloading files |
+| `-s, --silent` | Silent mode - outputs JSON for `--data`, suppresses logs otherwise |
+| `-h, --help` | Display help message |
+| `-v, --version` | Show version |
 
-### Examples
+## Examples
+
+### Downloading Packages
 
 ```bash
-# Download 5 most recent versions (default)
-node undelete.js express
+# Download latest 5 versions of an NPM package
+undelete npm express
 
-# Download 10 versions
-node undelete.js @angular/core -n 10
+# Download specific number of versions
+undelete npm @angular/core -n 10
 
-# Download to specific directory
-node undelete.js lodash --path ./downloads
+# Download to a specific directory
+undelete npm lodash --path ./downloads
 
-# Get package metadata
-node undelete.js express --data
+# Download PyPI package
+undelete pypi requests
 
-# Get metadata as JSON (silent mode) # GREAT FOR SCRIPTING
-node undelete.js react -d -s
-
-# Combine options
-node undelete.js react -p /tmp/packages -n 15 -s
+# Download PyPI package with options
+undelete pypi flask -n 3 -p ./malware_samples
 ```
 
-## Features
+### Getting Package Metadata
 
-- Downloads 1-20 most recent versions of any package (default: 5)
-- Retrieves package metadata including NPM user, email, and maintainers
-- Checks 5 registries in order: npmjs.org, cnpmjs.org, npmmirror.com, huaweicloud.com, tencent.com
-- Automatic retry (up to 10 attempts for Tencent mirror)
-- Skips security placeholder packages (0.0.1-security.tgz)
-- Custom output directory support
-- Silent mode for automation and JSON output
-- No external dependencies
+The `--data` flag retrieves package metadata including maintainer information, which is useful for investigating removed malicious packages.
 
-## Requirements
+```bash
+# Human-readable output
+undelete npm express --data
 
-Node.js 12.0.0 or higher
+# JSON output (for scripting)
+undelete npm mayhem-wma --data --silent
 
-## Output
+# PyPI metadata
+undelete pypi some-package --data -s
+```
 
-### Download Mode
-Downloaded files are saved as `{package-name}-{version}.tgz` in the specified directory.
-
-### Data Mode
-Normal mode displays formatted package information. Silent mode (`-d -s`) outputs JSON:
+### Example JSON Output
 
 ```json
 {
-  "package": "fake-tokens",
-  "version": "0.1.11",
-  "description": "Generate fake access tokens",
-  "npmUser": "6mile",
-  "npmUserEmail": "6mile@linux.com",
+  "package": "mayhem-wma",
+  "version": "1.0.1",
+  "description": "Mayhem WMA - A professional utility package...",
+  "npmUser": "petternilssonorg",
+  "npmUserEmail": "piter.jb0817@gmail.com",
   "maintainers": [
     {
-      "name": "6mile",
-      "email": "6mile@linux.com"
+      "name": "petternilssonorg",
+      "email": "piter.jb0817@gmail.com"
     }
-  ]
+  ],
+  "repository": "https://github.com/kinexbt/mayhem-wma",
+  "license": "MIT",
+  "downloads": null,
+  "dependentPackages": 0,
+  "dependentRepos": 0,
+  "firstPublished": "2025-11-20T00:05:31.566Z",
+  "lastPublished": "2025-11-20T00:05:31.566Z",
+  "isSecurityPlaceholder": true
 }
 ```
-
-## Notes
-
-- Tencent mirror may require multiple retry attempts
-- Script stops after successfully downloading/retrieving from first available registry
-- Security placeholder versions (0.0.1-security.tgz) are automatically skipped
-- Security placeholder emails (npm@npmjs.com) are automatically skipped
-- Exit code 0 on success, 1 on failure
 
 ## License
 
 MIT
+
+## Author
+
+Created by [6mile](https://github.com/6mile)
+
+## Contributing
+
+Issues and pull requests welcome at [github.com/6mile/undelete](https://github.com/6mile/undelete)
