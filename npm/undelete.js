@@ -7,6 +7,7 @@ const path = require('path');
 const { URL } = require('url');
 const { exec } = require('child_process');
 const util = require('util');
+const crypto = require('crypto');
 
 const execPromise = util.promisify(exec);
 
@@ -25,15 +26,33 @@ const NPM_VIEW_REGISTRIES = [
     "https://mirrors.cloud.tencent.com/npm/"
 ];
 
+// kmsec.uk DPRK research archive for removed npm packages
+const KMSEC_API = "https://dprk-research.kmsec.uk/api/tarfiles/";
+const KMSEC_LISTING = "https://dprk-research.kmsec.uk/?json";
+
 // Ecosyste.ms API endpoints for different registries
 const ECOSYSTEMS_API = {
     npm: "https://packages.ecosyste.ms/api/v1/registries/npmjs.org/packages/",
     pypi: "https://packages.ecosyste.ms/api/v1/registries/pypi.org/packages/"
 };
 
+// BigQuery fallback for deleted PyPI packages (uses OAuth2 with service account)
+
 const SUPPORTED_REGISTRIES = ['npm', 'pypi'];
 
-const VERSION = "1.3.1";
+const VERSION = "1.5.0";
+
+/**
+ * Check if a tarball URL is a security placeholder
+ * Matches patterns like:
+ * - package-0.0.1-security.tgz
+ * - package-0.0.1-security.0.tgz
+ * @param {string} tarballUrl - The tarball URL to check
+ * @returns {boolean} - True if it's a security placeholder
+ */
+function isSecurityPlaceholderTarball(tarballUrl) {
+    return /0\.0\.1-security(\.\d+)?\.tgz$/.test(tarballUrl);
+}
 
 let SILENT_MODE = false;
 
@@ -81,14 +100,17 @@ REGISTRIES:
 
 OPTIONS:
   -n, --number <count>      Number of versions to download (1-20, default: 5)
-  
+
   -p, --path <directory>    Save downloaded packages to specified directory
                             (default: current directory)
-  
+
   -d, --data                Get package metadata instead of downloading files
-  
+
   -s, --silent              Run in silent mode (JSON output for --data)
-  
+
+  --gcp-credentials <file>  Path to GCP service account JSON file for PyPI
+                            BigQuery fallback (also reads GCP_CREDENTIALS env var)
+
   -h, --help                Display this help message
 
   -v, --version             Show the version of undelete
@@ -106,12 +128,33 @@ EXAMPLES:
 
 DESCRIPTION:
   Recovers packages that have been removed from NPM or PyPI registries.
-  
+
   For NPM: Uses Chinese mirror servers that may still have cached copies.
+           Falls back to kmsec.uk DPRK research archive for malicious packages.
   For PyPI: Uses ecosyste.ms which indexes files.pythonhosted.org URLs.
-  
+           If ecosyste.ms has no data, falls back to:
+           1. PyPI JSON API (for non-quarantined packages)
+           2. PyPI Simple API (detects quarantine status)
+           3. Puppeteer headless browser (for quarantined package details)
+           4. BigQuery (requires GCP credentials) for deleted packages
+
+  Quarantined packages: When PyPI flags a package as malicious, it is
+  quarantined and hidden from the JSON API. This tool uses a headless
+  browser (Puppeteer) to scrape the project page for maintainer info.
+
   The --data flag retrieves package metadata including maintainer info,
   which is useful for security research on removed malicious packages.
+
+OPTIONAL DEPENDENCIES:
+  For quarantined PyPI packages, install puppeteer for full metadata:
+    npm install puppeteer        # includes bundled Chromium
+    npm install puppeteer-core   # uses system Chrome (lighter)
+
+BIGQUERY SETUP (for PyPI fallback):
+  1. Create a Google Cloud project (free tier available)
+  2. Enable the BigQuery API
+  3. Create a service account and download the JSON key file
+  4. Pass via --gcp-credentials or GCP_CREDENTIALS environment variable
 `);
     process.exit(0);
 }
@@ -240,6 +283,700 @@ async function fetchEcosystemsVersions(packageName, registry = 'npm') {
 }
 
 /**
+ * Generate a signed JWT for Google service account authentication
+ * @param {Object} credentials - Service account credentials from JSON file
+ * @returns {string} - Signed JWT token
+ */
+function generateServiceAccountJWT(credentials) {
+    const now = Math.floor(Date.now() / 1000);
+    const expiry = now + 3600; // 1 hour
+
+    const header = {
+        alg: 'RS256',
+        typ: 'JWT'
+    };
+
+    const payload = {
+        iss: credentials.client_email,
+        scope: 'https://www.googleapis.com/auth/bigquery.readonly',
+        aud: 'https://oauth2.googleapis.com/token',
+        iat: now,
+        exp: expiry
+    };
+
+    const base64Header = Buffer.from(JSON.stringify(header)).toString('base64url');
+    const base64Payload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signatureInput = `${base64Header}.${base64Payload}`;
+
+    const sign = crypto.createSign('RSA-SHA256');
+    sign.update(signatureInput);
+    const signature = sign.sign(credentials.private_key, 'base64url');
+
+    return `${signatureInput}.${signature}`;
+}
+
+/**
+ * Exchange a signed JWT for a Google OAuth2 access token
+ * @param {string} jwt - Signed JWT token
+ * @returns {Promise<string|null>} - Access token or null on failure
+ */
+async function getGoogleAccessToken(jwt) {
+    return new Promise((resolve) => {
+        const postData = new URLSearchParams({
+            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            assertion: jwt
+        }).toString();
+
+        const options = {
+            hostname: 'oauth2.googleapis.com',
+            path: '/token',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Length': Buffer.byteLength(postData)
+            },
+            timeout: 15000
+        };
+
+        const request = https.request(options, (response) => {
+            let data = '';
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.access_token) {
+                        resolve(parsed.access_token);
+                    } else {
+                        log(`  [BigQuery] OAuth error: ${parsed.error_description || parsed.error || 'Unknown'}`);
+                        resolve(null);
+                    }
+                } catch (e) {
+                    log(`  [BigQuery] Error parsing OAuth response: ${e.message}`);
+                    resolve(null);
+                }
+            });
+        });
+
+        request.on('error', (e) => {
+            log(`  [BigQuery] OAuth connection error: ${e.message}`);
+            resolve(null);
+        });
+
+        request.on('timeout', () => {
+            request.destroy();
+            log(`  [BigQuery] OAuth request timeout`);
+            resolve(null);
+        });
+
+        request.write(postData);
+        request.end();
+    });
+}
+
+/**
+ * Load and validate GCP service account credentials from a JSON file
+ * @param {string} credentialsPath - Path to the service account JSON file
+ * @returns {Object|null} - Credentials object or null if invalid
+ */
+function loadGCPCredentials(credentialsPath) {
+    try {
+        const content = fs.readFileSync(credentialsPath, 'utf8');
+        const credentials = JSON.parse(content);
+
+        if (!credentials.client_email || !credentials.private_key || !credentials.project_id) {
+            log(`  [BigQuery] Invalid credentials file: missing required fields`);
+            return null;
+        }
+
+        return credentials;
+    } catch (e) {
+        log(`  [BigQuery] Error loading credentials: ${e.message}`);
+        return null;
+    }
+}
+
+/**
+ * Fetch PyPI package download URLs from BigQuery public dataset
+ * This is a fallback when ecosyste.ms doesn't have download URLs
+ * @param {string} packageName - The package name to look up
+ * @param {string} credentialsPath - Path to GCP service account JSON file
+ * @returns {Promise<Array>} - Array of { version, url, filename } or empty array
+ */
+async function fetchPyPIUrlsFromBigQuery(packageName, credentialsPath) {
+    // Load and validate credentials
+    const credentials = loadGCPCredentials(credentialsPath);
+    if (!credentials) {
+        return [];
+    }
+
+    // Generate JWT and exchange for access token
+    log(`  [BigQuery] Authenticating with service account...`);
+    const jwt = generateServiceAccountJWT(credentials);
+    const accessToken = await getGoogleAccessToken(jwt);
+
+    if (!accessToken) {
+        return [];
+    }
+
+    return new Promise((resolve) => {
+        const query = `
+            SELECT name, version, path, filename
+            FROM \`bigquery-public-data.pypi.distribution_metadata\`
+            WHERE LOWER(name) = LOWER(@pkg)
+        `;
+
+        const requestBody = JSON.stringify({
+            query: query,
+            useLegacySql: false,
+            parameterMode: "NAMED",
+            queryParameters: [{
+                name: "pkg",
+                parameterType: { type: "STRING" },
+                parameterValue: { value: packageName }
+            }]
+        });
+
+        const options = {
+            hostname: 'bigquery.googleapis.com',
+            path: `/bigquery/v2/projects/${credentials.project_id}/queries`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(requestBody),
+                'Authorization': `Bearer ${accessToken}`
+            },
+            timeout: 30000
+        };
+
+        log(`  [BigQuery] Querying PyPI distribution metadata...`);
+
+        const request = https.request(options, (response) => {
+            let data = '';
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+
+                    if (parsed.error) {
+                        log(`  [BigQuery] API error: ${parsed.error.message || 'Unknown error'}`);
+                        resolve([]);
+                        return;
+                    }
+
+                    if (!parsed.rows || parsed.rows.length === 0) {
+                        log(`  [BigQuery] No results found`);
+                        resolve([]);
+                        return;
+                    }
+
+                    // Parse the results
+                    // Schema: name (f[0]), version (f[1]), path (f[2]), filename (f[3])
+                    const results = parsed.rows.map(row => {
+                        const version = row.f[1].v;
+                        const pathValue = row.f[2].v;
+                        const filename = row.f[3].v;
+
+                        // Construct the full URL from the path
+                        // path format: xx/yy/hash/filename
+                        const url = `https://files.pythonhosted.org/packages/${pathValue}`;
+
+                        return { version, url, filename };
+                    });
+
+                    log(`  [BigQuery] Found ${results.length} file(s)`);
+                    resolve(results);
+                } catch (e) {
+                    log(`  [BigQuery] Error parsing response: ${e.message}`);
+                    resolve([]);
+                }
+            });
+        });
+
+        request.on('error', (e) => {
+            log(`  [BigQuery] Connection error: ${e.message}`);
+            resolve([]);
+        });
+
+        request.on('timeout', () => {
+            request.destroy();
+            log(`  [BigQuery] Request timeout`);
+            resolve([]);
+        });
+
+        request.write(requestBody);
+        request.end();
+    });
+}
+
+/**
+ * Fetch package data from PyPI JSON API
+ * This is the preferred method for getting full package metadata
+ * @param {string} packageName - The package name to look up
+ * @returns {Promise<Object|null>} - Package data or null if not found
+ */
+async function fetchPyPIJsonApi(packageName) {
+    return new Promise((resolve) => {
+        const url = `https://pypi.org/pypi/${encodeURIComponent(packageName)}/json`;
+
+        log(`  [pypi.org] Fetching JSON API...`);
+
+        const request = https.get(url, { timeout: 15000 }, (response) => {
+            if (response.statusCode === 200) {
+                let data = '';
+                response.on('data', chunk => data += chunk);
+                response.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(data);
+                        const info = parsed.info || {};
+
+                        // Extract download URLs from releases
+                        const downloadUrls = [];
+                        if (parsed.urls && Array.isArray(parsed.urls)) {
+                            for (const file of parsed.urls) {
+                                if (file.url) {
+                                    downloadUrls.push({
+                                        url: file.url,
+                                        filename: file.filename || file.url.split('/').pop(),
+                                        packagetype: file.packagetype
+                                    });
+                                }
+                            }
+                        }
+
+                        const result = {
+                            name: packageName,
+                            version: info.version || null,
+                            description: info.summary || info.description || null,
+                            maintainer: info.maintainer || info.author || null,
+                            maintainerEmail: info.maintainer_email || info.author_email || null,
+                            homepage: info.home_page || info.project_url || null,
+                            license: info.license || null,
+                            downloadUrls: downloadUrls,
+                            isQuarantined: false,
+                            source: 'pypi.org'
+                        };
+
+                        log(`  [pypi.org] Found: version=${result.version || 'unknown'}, author=${result.maintainer || 'unknown'}`);
+                        resolve(result);
+                    } catch (e) {
+                        log(`  [pypi.org] Error parsing JSON: ${e.message}`);
+                        resolve(null);
+                    }
+                });
+            } else if (response.statusCode === 404) {
+                log(`  [pypi.org] JSON API returned 404 (package may be quarantined)`);
+                resolve(null);
+            } else {
+                log(`  [pypi.org] JSON API HTTP ${response.statusCode}`);
+                resolve(null);
+            }
+        });
+
+        request.on('error', (e) => {
+            log(`  [pypi.org] Connection error: ${e.message}`);
+            resolve(null);
+        });
+
+        request.on('timeout', () => {
+            request.destroy();
+            log(`  [pypi.org] Request timeout`);
+            resolve(null);
+        });
+    });
+}
+
+/**
+ * Fetch package data from PyPI Simple API
+ * This works even for quarantined packages and can detect quarantine status
+ * @param {string} packageName - The package name to look up
+ * @returns {Promise<Object|null>} - Package data or null if not found
+ */
+async function fetchPyPISimpleApi(packageName) {
+    return new Promise((resolve) => {
+        const url = `https://pypi.org/simple/${encodeURIComponent(packageName)}/`;
+
+        log(`  [pypi.org] Fetching Simple API...`);
+
+        const request = https.get(url, { timeout: 15000 }, (response) => {
+            if (response.statusCode === 200) {
+                let html = '';
+                response.on('data', chunk => html += chunk);
+                response.on('end', () => {
+                    const result = {
+                        name: packageName,
+                        version: null,
+                        description: null,
+                        maintainer: null,
+                        maintainerEmail: null,
+                        downloadUrls: [],
+                        isQuarantined: false,
+                        source: 'pypi.org'
+                    };
+
+                    // Check for quarantine status
+                    if (html.includes('content="quarantined"') ||
+                        html.includes("content='quarantined'") ||
+                        html.includes('pypi:project-status" content="quarantined"')) {
+                        result.isQuarantined = true;
+                        log(`  [pypi.org] Package is quarantined`);
+                    }
+
+                    // Extract download URLs from Simple API
+                    // Format: <a href="https://files.pythonhosted.org/packages/...">filename</a>
+                    const linkPattern = /<a[^>]+href="(https:\/\/files\.pythonhosted\.org\/packages\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+                    let match;
+                    const seenUrls = new Set();
+
+                    while ((match = linkPattern.exec(html)) !== null) {
+                        const url = match[1];
+                        const filename = match[2].trim();
+
+                        if (!seenUrls.has(url)) {
+                            seenUrls.add(url);
+
+                            // Extract version from filename
+                            let version = null;
+                            const versionMatch = filename.match(/-(\d+\.\d+(?:\.\d+)?(?:[\w.-]*)?)(?:\.tar\.gz|\.whl|\.zip|-py|-cp)/);
+                            if (versionMatch) {
+                                version = versionMatch[1];
+                                // Update result version to latest found
+                                if (!result.version || compareVersions(version, result.version) < 0) {
+                                    result.version = version;
+                                }
+                            }
+
+                            result.downloadUrls.push({
+                                url: url,
+                                filename: filename,
+                                version: version
+                            });
+                        }
+                    }
+
+                    if (result.isQuarantined || result.downloadUrls.length > 0) {
+                        log(`  [pypi.org] Found: quarantined=${result.isQuarantined}, files=${result.downloadUrls.length}`);
+                        resolve(result);
+                    } else {
+                        log(`  [pypi.org] No data found in Simple API`);
+                        resolve(null);
+                    }
+                });
+            } else if (response.statusCode === 404) {
+                log(`  [pypi.org] Package not found`);
+                resolve(null);
+            } else {
+                log(`  [pypi.org] Simple API HTTP ${response.statusCode}`);
+                resolve(null);
+            }
+        });
+
+        request.on('error', (e) => {
+            log(`  [pypi.org] Connection error: ${e.message}`);
+            resolve(null);
+        });
+
+        request.on('timeout', () => {
+            request.destroy();
+            log(`  [pypi.org] Request timeout`);
+            resolve(null);
+        });
+    });
+}
+
+/**
+ * Try to load puppeteer or puppeteer-core dynamically
+ * @returns {Object|null} - Puppeteer module or null if not available
+ */
+function tryLoadPuppeteer() {
+    try {
+        return require('puppeteer');
+    } catch (e) {
+        try {
+            return require('puppeteer-core');
+        } catch (e2) {
+            return null;
+        }
+    }
+}
+
+/**
+ * Find Chrome/Chromium executable path for puppeteer-core
+ * @returns {string|null} - Path to Chrome executable or null
+ */
+function findChromePath() {
+    const { execSync } = require('child_process');
+    const platform = process.platform;
+
+    const paths = [];
+
+    if (platform === 'darwin') {
+        paths.push(
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            '/Applications/Chromium.app/Contents/MacOS/Chromium',
+            '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'
+        );
+    } else if (platform === 'linux') {
+        paths.push(
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/snap/bin/chromium'
+        );
+        // Try which command
+        try {
+            const chromePath = execSync('which google-chrome || which chromium || which chromium-browser', { encoding: 'utf8' }).trim();
+            if (chromePath) paths.unshift(chromePath);
+        } catch (e) {}
+    } else if (platform === 'win32') {
+        paths.push(
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe'
+        );
+    }
+
+    for (const p of paths) {
+        try {
+            if (fs.existsSync(p)) {
+                return p;
+            }
+        } catch (e) {}
+    }
+
+    return null;
+}
+
+/**
+ * Scrape PyPI project page using Puppeteer (headless browser)
+ * This bypasses JavaScript challenges and can access quarantined package pages
+ * @param {string} packageName - The package name to look up
+ * @returns {Promise<Object|null>} - Scraped package data or null
+ */
+async function scrapePyPIWithPuppeteer(packageName) {
+    const puppeteer = tryLoadPuppeteer();
+
+    if (!puppeteer) {
+        log(`  [puppeteer] Not installed. Install with: npm install puppeteer`);
+        return null;
+    }
+
+    let browser = null;
+    try {
+        log(`  [puppeteer] Launching headless browser...`);
+
+        // Determine launch options
+        const launchOptions = {
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        };
+
+        // If using puppeteer-core, we need to specify executablePath
+        if (puppeteer.executablePath && typeof puppeteer.executablePath === 'function') {
+            // Full puppeteer - has bundled browser
+            try {
+                launchOptions.executablePath = puppeteer.executablePath();
+            } catch (e) {
+                // May not have bundled browser, try to find system Chrome
+                const chromePath = findChromePath();
+                if (chromePath) {
+                    launchOptions.executablePath = chromePath;
+                }
+            }
+        } else {
+            // puppeteer-core - needs system Chrome
+            const chromePath = findChromePath();
+            if (!chromePath) {
+                log(`  [puppeteer] No Chrome/Chromium found. Install Chrome or use 'npm install puppeteer'`);
+                return null;
+            }
+            launchOptions.executablePath = chromePath;
+        }
+
+        browser = await puppeteer.launch(launchOptions);
+        const page = await browser.newPage();
+
+        // Set a realistic user agent
+        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+        const url = `https://pypi.org/project/${encodeURIComponent(packageName)}/`;
+        log(`  [puppeteer] Navigating to ${url}...`);
+
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+        // Wait a moment for any dynamic content
+        await page.waitForSelector('h1', { timeout: 10000 }).catch(() => {});
+
+        // Extract data from the page
+        const data = await page.evaluate(() => {
+            const result = {
+                version: null,
+                description: null,
+                maintainer: null,
+                maintainerUrl: null,
+                isQuarantined: false
+            };
+
+            // Check for quarantine banner
+            const bodyText = document.body.innerText || '';
+            if (bodyText.includes('quarantined') || bodyText.includes('under review')) {
+                result.isQuarantined = true;
+            }
+
+            // Get version from h1 (format: "packagename X.Y.Z")
+            const h1 = document.querySelector('h1.package-header__name');
+            if (h1) {
+                const text = h1.textContent.trim();
+                const match = text.match(/\s+(\d+\.\d+(?:\.\d+)?(?:[\w.-]*)?)$/);
+                if (match) {
+                    result.version = match[1];
+                }
+            }
+
+            // Get description from meta tag
+            const metaDesc = document.querySelector('meta[name="description"]');
+            if (metaDesc) {
+                result.description = metaDesc.getAttribute('content');
+            }
+
+            // Get maintainer from sidebar
+            const maintainerLink = document.querySelector('.sidebar-section__maintainer a[href^="/user/"]');
+            if (maintainerLink) {
+                result.maintainer = maintainerLink.textContent.trim();
+                result.maintainerUrl = 'https://pypi.org' + maintainerLink.getAttribute('href');
+            }
+
+            // Fallback: try author from metadata
+            if (!result.maintainer) {
+                const authorEl = document.querySelector('.author, [data-controller="author"]');
+                if (authorEl) {
+                    const link = authorEl.querySelector('a');
+                    result.maintainer = link ? link.textContent.trim() : authorEl.textContent.trim();
+                }
+            }
+
+            // Another fallback: look for Author: label
+            if (!result.maintainer) {
+                const sidebar = document.querySelector('.sidebar-section');
+                if (sidebar) {
+                    const text = sidebar.innerHTML;
+                    const authorMatch = text.match(/Author[:\s]*<[^>]*>([^<]+)</i);
+                    if (authorMatch) {
+                        result.maintainer = authorMatch[1].trim();
+                    }
+                }
+            }
+
+            return result;
+        });
+
+        await browser.close();
+        browser = null;
+
+        if (data.version || data.maintainer) {
+            log(`  [puppeteer] Found: version=${data.version || 'unknown'}, maintainer=${data.maintainer || 'unknown'}`);
+            return {
+                name: packageName,
+                version: data.version,
+                description: data.description,
+                maintainer: data.maintainer,
+                maintainerUrl: data.maintainerUrl,
+                maintainerEmail: null,
+                downloadUrls: [],
+                isQuarantined: data.isQuarantined,
+                source: 'pypi.org (puppeteer)'
+            };
+        }
+
+        log(`  [puppeteer] Could not extract data from page`);
+        return null;
+
+    } catch (e) {
+        log(`  [puppeteer] Error: ${e.message}`);
+        if (browser) {
+            try { await browser.close(); } catch (e2) {}
+        }
+        return null;
+    }
+}
+
+/**
+ * Get PyPI package data using JSON API with Simple API and Puppeteer fallbacks
+ * JSON API provides full metadata but returns 404 for quarantined packages
+ * Simple API works for quarantined packages but only provides download links
+ * Puppeteer can scrape the full page including maintainer info for quarantined packages
+ * @param {string} packageName - The package name to look up
+ * @returns {Promise<Object|null>} - Package data or null if not found
+ */
+async function scrapePyPIProjectPage(packageName) {
+    // First try JSON API (gives full metadata)
+    const jsonData = await fetchPyPIJsonApi(packageName);
+    if (jsonData) {
+        return jsonData;
+    }
+
+    // Fall back to Simple API (works for quarantined packages)
+    const simpleData = await fetchPyPISimpleApi(packageName);
+
+    // If quarantined and missing author info, try Puppeteer
+    if (simpleData && simpleData.isQuarantined && !simpleData.maintainer) {
+        log(`  [pypi.org] Package is quarantined, trying headless browser...`);
+        const puppeteerData = await scrapePyPIWithPuppeteer(packageName);
+
+        if (puppeteerData) {
+            // Merge puppeteer data with simple data (puppeteer has author, simple has download URLs)
+            return {
+                ...puppeteerData,
+                downloadUrls: simpleData.downloadUrls || puppeteerData.downloadUrls,
+                isQuarantined: true
+            };
+        }
+
+        // Puppeteer failed, return simple data with note
+        log(`  [pypi.org] Note: Install puppeteer for full quarantined package data`);
+        return simpleData;
+    }
+
+    if (simpleData) {
+        return simpleData;
+    }
+
+    return null;
+}
+
+/**
+ * Scrape PyPI download page for package files
+ * @param {string} packageName - The package name
+ * @param {string} version - The specific version to get files for (optional)
+ * @returns {Promise<Array>} - Array of { url, filename, version }
+ */
+/**
+ * Fetch download URLs for a specific version from PyPI
+ * Uses Simple API which works for all packages including quarantined ones
+ * @param {string} packageName - The package name
+ * @param {string} version - The specific version to get files for (optional, filters results)
+ * @returns {Promise<Array>} - Array of { url, filename, version }
+ */
+async function scrapePyPIDownloadPage(packageName, version = null) {
+    // Use Simple API to get all download URLs
+    const simpleData = await fetchPyPISimpleApi(packageName);
+
+    if (!simpleData || !simpleData.downloadUrls || simpleData.downloadUrls.length === 0) {
+        return [];
+    }
+
+    // If version specified, filter to that version only
+    if (version) {
+        const filtered = simpleData.downloadUrls.filter(f => f.version === version);
+        if (filtered.length > 0) {
+            return filtered;
+        }
+        // If no exact match, return all (caller will handle)
+    }
+
+    return simpleData.downloadUrls;
+}
+
+/**
  * Extract useful metadata from ecosyste.ms response
  * @param {Object} ecosystemsData - Data from ecosyste.ms API
  * @returns {Object} - Normalized metadata
@@ -311,7 +1048,7 @@ async function getPackageInfo(registry, packageName, isTencent = false) {
         if (isTencent && packageData.versions) {
             const versions = Object.values(packageData.versions);
             const allSecurity = versions.every(v => {
-                return v.dist && v.dist.tarball && v.dist.tarball.endsWith('0.0.1-security.tgz');
+                return v.dist && v.dist.tarball && isSecurityPlaceholderTarball(v.dist.tarball);
             });
             
             if (allSecurity && attempt < maxAttempts) {
@@ -888,112 +1625,185 @@ async function displayPackageData(packageName) {
  */
 async function displayPyPIPackageData(packageName) {
     showBanner();
-    
+
     log(`Fetching PyPI package metadata for: ${packageName}\n`);
     log(`Checking ecosyste.ms...`);
-    
+
     const ecosystemsData = await getEcosystemsData(packageName, 'pypi');
-    
-    if (!ecosystemsData) {
-        log("\nFailed to retrieve package metadata from ecosyste.ms");
+    let normalizedEcosystems = null;
+    let scrapedData = null;
+    let dataSource = 'ecosyste.ms';
+
+    if (ecosystemsData) {
+        normalizedEcosystems = normalizeEcosystemsData(ecosystemsData);
+        if (normalizedEcosystems) {
+            log(`  [ecosyste.ms] Package data retrieved successfully`);
+        }
+    }
+
+    // Fallback to web scraping if ecosyste.ms has no data
+    if (!normalizedEcosystems || (!normalizedEcosystems.latestVersion && !normalizedEcosystems.maintainers?.length)) {
+        log(`\nNo data from ecosyste.ms, trying pypi.org web scraping...`);
+        scrapedData = await scrapePyPIProjectPage(packageName);
+
+        if (scrapedData) {
+            dataSource = 'pypi.org';
+        }
+    }
+
+    // If we still have no data
+    if (!normalizedEcosystems && !scrapedData) {
+        log("\nFailed to retrieve package metadata from any source");
         process.exit(1);
     }
-    
-    const normalizedEcosystems = normalizeEcosystemsData(ecosystemsData);
-    
-    if (!normalizedEcosystems) {
-        log("\nFailed to parse package metadata");
-        process.exit(1);
-    }
-    
-    log(`  [ecosyste.ms] Package data retrieved successfully`);
-    
+
     // Output the data
     if (SILENT_MODE) {
-        // Determine maintainer info
-        let maintainers = [];
-        let primaryUser = null;
-        let primaryEmail = null;
-        
-        if (normalizedEcosystems.maintainers && normalizedEcosystems.maintainers.length > 0) {
-            maintainers = normalizedEcosystems.maintainers.map(m => ({
-                name: m.name || null,
-                email: m.email || null
-            }));
-            primaryUser = normalizedEcosystems.maintainers[0].name || null;
-            primaryEmail = normalizedEcosystems.maintainers[0].email || null;
+        let jsonOutput;
+
+        if (scrapedData && (!normalizedEcosystems || !normalizedEcosystems.latestVersion)) {
+            // Use scraped data as primary source
+            jsonOutput = {
+                package: packageName,
+                version: scrapedData.version,
+                description: scrapedData.description,
+                maintainer: scrapedData.maintainer,
+                maintainerEmail: null,
+                maintainerUrl: scrapedData.maintainerUrl,
+                maintainers: scrapedData.maintainer ? [{ name: scrapedData.maintainer, email: null }] : [],
+                repository: null,
+                license: null,
+                downloads: null,
+                dependentPackages: null,
+                dependentRepos: null,
+                firstPublished: null,
+                lastPublished: null,
+                downloadUrls: scrapedData.downloadUrls,
+                isQuarantined: scrapedData.isQuarantined,
+                source: 'pypi.org',
+                registry: 'pypi'
+            };
+        } else {
+            // Use ecosyste.ms data as primary source
+            let maintainers = [];
+            let primaryUser = null;
+            let primaryEmail = null;
+
+            if (normalizedEcosystems.maintainers && normalizedEcosystems.maintainers.length > 0) {
+                maintainers = normalizedEcosystems.maintainers.map(m => ({
+                    name: m.name || null,
+                    email: m.email || null
+                }));
+                primaryUser = normalizedEcosystems.maintainers[0].name || null;
+                primaryEmail = normalizedEcosystems.maintainers[0].email || null;
+            }
+
+            jsonOutput = {
+                package: packageName,
+                version: normalizedEcosystems.latestVersion,
+                description: normalizedEcosystems.description,
+                maintainer: primaryUser,
+                maintainerEmail: primaryEmail,
+                maintainers: maintainers,
+                repository: normalizedEcosystems.repository,
+                license: normalizedEcosystems.license,
+                downloads: normalizedEcosystems.downloads,
+                dependentPackages: normalizedEcosystems.dependentPackages,
+                dependentRepos: normalizedEcosystems.dependentRepos,
+                firstPublished: normalizedEcosystems.firstPublished,
+                lastPublished: normalizedEcosystems.lastPublished,
+                source: 'ecosyste.ms',
+                registry: 'pypi'
+            };
         }
-        
-        const jsonOutput = {
-            package: packageName,
-            version: normalizedEcosystems.latestVersion,
-            description: normalizedEcosystems.description,
-            maintainer: primaryUser,
-            maintainerEmail: primaryEmail,
-            maintainers: maintainers,
-            repository: normalizedEcosystems.repository,
-            license: normalizedEcosystems.license,
-            downloads: normalizedEcosystems.downloads,
-            dependentPackages: normalizedEcosystems.dependentPackages,
-            dependentRepos: normalizedEcosystems.dependentRepos,
-            firstPublished: normalizedEcosystems.firstPublished,
-            lastPublished: normalizedEcosystems.lastPublished,
-            registry: 'pypi'
-        };
         console.log(JSON.stringify(jsonOutput, null, 2));
         process.exit(0);
     }
-    
+
     // Human-readable output
-    log(`\nPackage: ${packageName}`);
-    log(`Version: ${normalizedEcosystems.latestVersion || 'Unknown'}`);
-    if (normalizedEcosystems.description) {
-        log(`Description: ${normalizedEcosystems.description}`);
+    if (scrapedData && scrapedData.isQuarantined) {
+        log(`\n⚠️  This package has been quarantined by PyPI administrators`);
+        log(`   Package data recovered from pypi.org:\n`);
     }
-    log('');
-    
-    if (normalizedEcosystems.downloads !== null) {
-        log(`Downloads (last month): ${normalizedEcosystems.downloads.toLocaleString()}`);
-    }
-    
-    if (normalizedEcosystems.license) {
-        log(`License: ${normalizedEcosystems.license}`);
-    }
-    
-    if (normalizedEcosystems.repository) {
-        log(`Repository: ${normalizedEcosystems.repository}`);
-    }
-    
-    if (normalizedEcosystems.dependentPackages !== null) {
-        log(`Dependent packages: ${normalizedEcosystems.dependentPackages.toLocaleString()}`);
-    }
-    
-    if (normalizedEcosystems.dependentRepos !== null) {
-        log(`Dependent repos: ${normalizedEcosystems.dependentRepos.toLocaleString()}`);
-    }
-    
-    if (normalizedEcosystems.firstPublished) {
-        log(`First published: ${normalizedEcosystems.firstPublished}`);
-    }
-    
-    if (normalizedEcosystems.lastPublished) {
-        log(`Last published: ${normalizedEcosystems.lastPublished}`);
-    }
-    
-    if (normalizedEcosystems.maintainers && normalizedEcosystems.maintainers.length > 0) {
+
+    if (scrapedData && (!normalizedEcosystems || !normalizedEcosystems.latestVersion)) {
+        // Display scraped data
+        log(`\nPackage: ${packageName}`);
+        log(`Version: ${scrapedData.version || 'Unknown'}`);
+        if (scrapedData.description) {
+            log(`Description: ${scrapedData.description}`);
+        }
         log('');
-        log(`Maintainers:`);
-        normalizedEcosystems.maintainers.forEach((maintainer, index) => {
-            log(`  ${index + 1}. ${maintainer.name}`);
-            if (maintainer.email) log(`     Email: ${maintainer.email}`);
-            if (maintainer.packagesCount) log(`     Packages: ${maintainer.packagesCount}`);
-            if (maintainer.htmlUrl) log(`     Profile: ${maintainer.htmlUrl}`);
-        });
+
+        if (scrapedData.maintainer) {
+            log(`Maintainer: ${scrapedData.maintainer}`);
+            if (scrapedData.maintainerUrl) {
+                log(`  Profile: ${scrapedData.maintainerUrl}`);
+            }
+        }
+
+        if (scrapedData.downloadUrls && scrapedData.downloadUrls.length > 0) {
+            log('');
+            log(`Download files:`);
+            scrapedData.downloadUrls.forEach((file, index) => {
+                log(`  ${index + 1}. ${file.filename}`);
+            });
+        }
+
+        log('');
+        log(`Data from: pypi.org (web scraping)`);
+    } else {
+        // Display ecosyste.ms data
+        log(`\nPackage: ${packageName}`);
+        log(`Version: ${normalizedEcosystems.latestVersion || 'Unknown'}`);
+        if (normalizedEcosystems.description) {
+            log(`Description: ${normalizedEcosystems.description}`);
+        }
+        log('');
+
+        if (normalizedEcosystems.downloads !== null) {
+            log(`Downloads (last month): ${normalizedEcosystems.downloads.toLocaleString()}`);
+        }
+
+        if (normalizedEcosystems.license) {
+            log(`License: ${normalizedEcosystems.license}`);
+        }
+
+        if (normalizedEcosystems.repository) {
+            log(`Repository: ${normalizedEcosystems.repository}`);
+        }
+
+        if (normalizedEcosystems.dependentPackages !== null) {
+            log(`Dependent packages: ${normalizedEcosystems.dependentPackages.toLocaleString()}`);
+        }
+
+        if (normalizedEcosystems.dependentRepos !== null) {
+            log(`Dependent repos: ${normalizedEcosystems.dependentRepos.toLocaleString()}`);
+        }
+
+        if (normalizedEcosystems.firstPublished) {
+            log(`First published: ${normalizedEcosystems.firstPublished}`);
+        }
+
+        if (normalizedEcosystems.lastPublished) {
+            log(`Last published: ${normalizedEcosystems.lastPublished}`);
+        }
+
+        if (normalizedEcosystems.maintainers && normalizedEcosystems.maintainers.length > 0) {
+            log('');
+            log(`Maintainers:`);
+            normalizedEcosystems.maintainers.forEach((maintainer, index) => {
+                log(`  ${index + 1}. ${maintainer.name}`);
+                if (maintainer.email) log(`     Email: ${maintainer.email}`);
+                if (maintainer.packagesCount) log(`     Packages: ${maintainer.packagesCount}`);
+                if (maintainer.htmlUrl) log(`     Profile: ${maintainer.htmlUrl}`);
+            });
+        }
+
+        log('');
+        log(`Data from: ecosyste.ms (pypi.org)`);
     }
-    
-    log('');
-    log(`Data from: ecosyste.ms (pypi.org)`);
-    
+
     process.exit(0);
 }
 
@@ -1002,49 +1812,196 @@ async function displayPyPIPackageData(packageName) {
  * @param {string} packageName - The package name
  * @param {number} versionCount - Number of versions to download
  * @param {string} outputPath - Directory to save files
+ * @param {string|null} gcpCredentials - Optional path to GCP service account JSON for BigQuery fallback
  */
-async function downloadPyPIPackages(packageName, versionCount, outputPath) {
+async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials = null) {
     showBanner();
-    
+
     log(`Searching for PyPI package: ${packageName}`);
     log(`Requesting ${versionCount} version(s)`);
     log(`Output directory: ${outputPath}\n`);
-    
+
     log(`Checking ecosyste.ms for package versions...`);
-    
+
     // Fetch versions from ecosyste.ms
-    const versions = await fetchEcosystemsVersions(packageName, 'pypi');
-    
+    let versions = await fetchEcosystemsVersions(packageName, 'pypi');
+    let selectedVersions = [];
+    let usedBigQueryAsPrimary = false;
+    let usedWebScrapingAsPrimary = false;
+
     if (!versions || versions.length === 0) {
-        log(`\nNo versions found for ${packageName} on ecosyste.ms`);
-        process.exit(1);
+        // ecosyste.ms has no data - try BigQuery as fallback
+        if (gcpCredentials) {
+            log(`\nNo versions found on ecosyste.ms, trying BigQuery...`);
+            const bigqueryResults = await fetchPyPIUrlsFromBigQuery(packageName, gcpCredentials);
+
+            if (bigqueryResults.length > 0) {
+                // Convert BigQuery results to version objects and dedupe by version
+                const versionMap = new Map();
+                for (const r of bigqueryResults) {
+                    // Prefer .tar.gz over .whl for source packages
+                    if (!versionMap.has(r.version) || r.filename.endsWith('.tar.gz')) {
+                        versionMap.set(r.version, {
+                            number: r.version,
+                            download_url: r.url,
+                            filename: r.filename
+                        });
+                    }
+                }
+
+                // Sort by version (semver-like) and take requested count
+                versions = Array.from(versionMap.values());
+                versions.sort((a, b) => compareVersions(a.number, b.number));
+                selectedVersions = versions.slice(0, versionCount);
+                usedBigQueryAsPrimary = true;
+
+                log(`  [BigQuery] Found ${versionMap.size} version(s), downloading ${selectedVersions.length}:`);
+                selectedVersions.forEach(v => log(`    - ${v.number}`));
+                log('');
+            }
+        }
+
+        // If still no versions, try web scraping as final fallback
+        if (selectedVersions.length === 0) {
+            log(`\nNo versions from ecosyste.ms${gcpCredentials ? ' or BigQuery' : ''}, trying pypi.org web scraping...`);
+            const scrapedData = await scrapePyPIProjectPage(packageName);
+
+            if (scrapedData && scrapedData.downloadUrls && scrapedData.downloadUrls.length > 0) {
+                // Convert scraped URLs to version objects
+                const versionMap = new Map();
+                for (const file of scrapedData.downloadUrls) {
+                    // Extract version from filename
+                    const versionMatch = file.filename.match(/-(\d+\.\d+(?:\.\d+)?(?:[\w.-]*)?)(?:\.tar\.gz|\.whl|\.zip|-py)/);
+                    const version = versionMatch ? versionMatch[1] : scrapedData.version;
+
+                    if (version) {
+                        // Prefer .tar.gz over .whl
+                        if (!versionMap.has(version) || file.filename.endsWith('.tar.gz')) {
+                            versionMap.set(version, {
+                                number: version,
+                                download_url: file.url,
+                                filename: file.filename
+                            });
+                        }
+                    }
+                }
+
+                if (versionMap.size > 0) {
+                    versions = Array.from(versionMap.values());
+                    versions.sort((a, b) => compareVersions(a.number, b.number));
+                    selectedVersions = versions.slice(0, versionCount);
+                    usedWebScrapingAsPrimary = true;
+
+                    if (scrapedData.isQuarantined) {
+                        log(`  ⚠️  Package is quarantined by PyPI administrators`);
+                    }
+                    log(`  [pypi.org] Found ${versionMap.size} version(s), downloading ${selectedVersions.length}:`);
+                    selectedVersions.forEach(v => log(`    - ${v.number}`));
+                    log('');
+                }
+            } else if (scrapedData && scrapedData.version) {
+                // We have version info but no download URLs on main page, try download page
+                log(`  Trying to fetch download page for version ${scrapedData.version}...`);
+                const downloadFiles = await scrapePyPIDownloadPage(packageName, scrapedData.version);
+
+                if (downloadFiles.length > 0) {
+                    // Prefer .tar.gz files
+                    const tarGz = downloadFiles.find(f => f.filename.endsWith('.tar.gz'));
+                    const selectedFile = tarGz || downloadFiles[0];
+
+                    selectedVersions = [{
+                        number: scrapedData.version,
+                        download_url: selectedFile.url,
+                        filename: selectedFile.filename
+                    }];
+                    usedWebScrapingAsPrimary = true;
+
+                    if (scrapedData.isQuarantined) {
+                        log(`  ⚠️  Package is quarantined by PyPI administrators`);
+                    }
+                    log(`  [pypi.org] Found download for version ${scrapedData.version}`);
+                    log('');
+                }
+            }
+        }
+
+        // If still nothing found, exit with error
+        if (selectedVersions.length === 0) {
+            log(`\nNo versions found for ${packageName}`);
+            if (!gcpCredentials) {
+                log(`Tip: Use --gcp-credentials to enable BigQuery fallback for deleted packages.\n`);
+            }
+            process.exit(1);
+        }
+    } else {
+        // ecosyste.ms found versions - sort and select
+        versions.sort((a, b) => {
+            const dateA = new Date(a.published_at || 0);
+            const dateB = new Date(b.published_at || 0);
+            return dateB - dateA;
+        });
+
+        selectedVersions = versions.slice(0, versionCount);
+
+        log(`  Found ${versions.length} total version(s), downloading ${selectedVersions.length}:`);
+        selectedVersions.forEach(v => log(`    - ${v.number}`));
+        log('');
+
+        // Check if any versions are missing download URLs
+        const versionsWithoutUrls = selectedVersions.filter(v => !v.download_url);
+
+        // Try BigQuery fallback if we have versions without URLs and credentials provided
+        if (versionsWithoutUrls.length > 0 && gcpCredentials) {
+            log(`Some versions missing download URLs, trying BigQuery fallback...`);
+            const bigqueryResults = await fetchPyPIUrlsFromBigQuery(packageName, gcpCredentials);
+
+            // Merge BigQuery URLs into version data
+            for (const v of versionsWithoutUrls) {
+                const bqMatch = bigqueryResults.find(r => r.version === v.number);
+                if (bqMatch) {
+                    v.download_url = bqMatch.url;
+                    log(`  [BigQuery] Found URL for version ${v.number}`);
+                }
+            }
+            log('');
+        }
+
+        // Try web scraping for versions still missing URLs
+        const stillMissingUrls = selectedVersions.filter(v => !v.download_url);
+        if (stillMissingUrls.length > 0) {
+            log(`Trying pypi.org web scraping for ${stillMissingUrls.length} version(s) missing URLs...`);
+            for (const v of stillMissingUrls) {
+                const downloadFiles = await scrapePyPIDownloadPage(packageName, v.number);
+                if (downloadFiles.length > 0) {
+                    // Prefer .tar.gz files
+                    const tarGz = downloadFiles.find(f => f.filename.endsWith('.tar.gz'));
+                    const selectedFile = tarGz || downloadFiles[0];
+                    v.download_url = selectedFile.url;
+                    log(`  [pypi.org] Found URL for version ${v.number}`);
+                }
+            }
+            log('');
+        }
+
+        const finalMissingUrls = selectedVersions.filter(v => !v.download_url);
+        if (finalMissingUrls.length > 0 && !gcpCredentials) {
+            log(`Note: ${finalMissingUrls.length} version(s) still missing download URLs.`);
+            log(`      Use --gcp-credentials or GCP_CREDENTIALS env var to enable BigQuery fallback.\n`);
+        }
     }
-    
-    // Sort by published_at descending (newest first) and take requested count
-    versions.sort((a, b) => {
-        const dateA = new Date(a.published_at || 0);
-        const dateB = new Date(b.published_at || 0);
-        return dateB - dateA;
-    });
-    
-    const selectedVersions = versions.slice(0, versionCount);
-    
-    log(`  Found ${versions.length} total version(s), downloading ${selectedVersions.length}:`);
-    selectedVersions.forEach(v => log(`    - ${v.number}`));
-    log('');
-    
+
     let successCount = 0;
     for (const versionData of selectedVersions) {
         const version = versionData.number;
         const downloadUrl = versionData.download_url;
-        
+
         if (!downloadUrl) {
             log(`  No download URL for version ${version}, skipping...`);
             continue;
         }
-        
+
         log(`Downloading ${packageName}@${version}...`);
-        
+
         try {
             const success = await performDownload(downloadUrl, packageName, version, outputPath);
             if (success) {
@@ -1054,9 +2011,11 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath) {
             log(`  Download failed: ${e.message}`);
         }
     }
-    
+
     if (successCount > 0) {
-        log(`\nSuccessfully downloaded ${successCount} version(s) from files.pythonhosted.org`);
+        const source = usedWebScrapingAsPrimary ? 'pypi.org (web scraping)' :
+                       usedBigQueryAsPrimary ? 'BigQuery' : 'files.pythonhosted.org';
+        log(`\nSuccessfully downloaded ${successCount} version(s) from ${source}`);
         process.exit(0);
     } else {
         log(`\nFailed to download any versions`);
@@ -1100,7 +2059,7 @@ async function tryNpmViewMethod(packageName, versionCount, outputPath) {
                     const tarball = versionData.dist.tarball;
                     
                     // Skip security placeholder tarballs
-                    if (!tarball.endsWith('0.0.1-security.tgz')) {
+                    if (!isSecurityPlaceholderTarball(tarball)) {
                         validTarballs.push({
                             version: versionData.version,
                             url: tarball
@@ -1148,6 +2107,141 @@ async function tryNpmViewMethod(packageName, versionCount, outputPath) {
     return false;
 }
 
+// ==========================================
+// kmsec.uk DPRK Research Archive
+// ==========================================
+
+/**
+ * Fetch the kmsec.uk package listing and find entries for a given package
+ * @param {string} packageName - The package name to search for
+ * @returns {Promise<Array>} - Array of matching entries with { name, version, released_date, npm_user, npm_email }
+ */
+async function fetchKmsecPackageListing(packageName) {
+    return new Promise((resolve) => {
+        log(`  [kmsec.uk] Fetching package listing...`);
+
+        const request = https.get(KMSEC_LISTING, { timeout: 15000 }, (response) => {
+            if (response.statusCode === 200) {
+                let data = '';
+                response.on('data', chunk => data += chunk);
+                response.on('end', () => {
+                    try {
+                        const entries = JSON.parse(data);
+                        // Filter for matching package name (case-insensitive)
+                        const matches = entries.filter(e =>
+                            e.name && e.name.toLowerCase() === packageName.toLowerCase()
+                        );
+                        resolve(matches);
+                    } catch (e) {
+                        log(`  [kmsec.uk] Error parsing JSON listing`);
+                        resolve([]);
+                    }
+                });
+            } else {
+                log(`  [kmsec.uk] Listing HTTP ${response.statusCode}`);
+                resolve([]);
+            }
+        });
+
+        request.on('error', (e) => {
+            log(`  [kmsec.uk] Connection error: ${e.message}`);
+            resolve([]);
+        });
+
+        request.on('timeout', () => {
+            request.destroy();
+            log(`  [kmsec.uk] Request timeout`);
+            resolve([]);
+        });
+    });
+}
+
+/**
+ * Try to download a single npm package version from kmsec.uk research archive
+ * @param {string} packageName - The package name
+ * @param {string} version - The package version
+ * @param {string} outputPath - Directory to save files
+ * @returns {Promise<boolean>} - True if download succeeded
+ */
+async function tryKmsecDownload(packageName, version, outputPath) {
+    const url = `${KMSEC_API}${encodeURIComponent(packageName)}/${encodeURIComponent(version)}`;
+
+    log(`  [kmsec.uk] Downloading ${packageName}@${version}...`);
+
+    try {
+        const success = await performDownload(url, packageName, version, outputPath);
+        if (success) {
+            return true;
+        }
+    } catch (e) {
+        log(`  [kmsec.uk] Failed: ${e.message}`);
+    }
+
+    return false;
+}
+
+/**
+ * Try kmsec.uk as a fallback source for npm packages
+ * First queries the listing API to find available versions, then downloads them
+ * @param {string} packageName - The package name
+ * @param {Array} knownVersions - Array of version strings discovered from other sources (used as fallback)
+ * @param {number} versionCount - Max number of versions to download
+ * @param {string} outputPath - Directory to save files
+ * @returns {Promise<boolean>} - True if any downloads succeeded
+ */
+async function tryKmsecMethod(packageName, knownVersions, versionCount, outputPath) {
+    log(`\nTrying kmsec.uk DPRK research archive...`);
+
+    // Query the kmsec.uk listing to find available versions
+    const kmsecEntries = await fetchKmsecPackageListing(packageName);
+
+    let versionsToTry = [];
+
+    if (kmsecEntries.length > 0) {
+        // Sort by release date (newest first)
+        kmsecEntries.sort((a, b) => (b.released || 0) - (a.released || 0));
+
+        // Dedupe by version
+        const seen = new Set();
+        for (const entry of kmsecEntries) {
+            if (entry.version && !seen.has(entry.version)) {
+                seen.add(entry.version);
+                versionsToTry.push(entry.version);
+            }
+        }
+
+        log(`  [kmsec.uk] Found ${versionsToTry.length} version(s) in archive`);
+    } else {
+        // Package not in listing — try known versions as fallback
+        if (knownVersions && knownVersions.length > 0) {
+            versionsToTry = knownVersions;
+            log(`  [kmsec.uk] Not in listing, trying ${versionsToTry.length} known version(s)...`);
+        } else {
+            log(`  [kmsec.uk] Package not found in archive`);
+            return false;
+        }
+    }
+
+    const toTry = versionsToTry.slice(0, versionCount);
+    log(`  Downloading ${toTry.length} version(s): ${toTry.join(', ')}`);
+
+    let successCount = 0;
+    for (const version of toTry) {
+        const success = await tryKmsecDownload(packageName, version, outputPath);
+        if (success) {
+            successCount++;
+        }
+    }
+
+    if (successCount > 0) {
+        log(`\nSuccessfully downloaded ${successCount} version(s) from kmsec.uk`);
+        return true;
+    }
+
+    log(`  [kmsec.uk] Failed to download any versions`);
+    return false;
+}
+
 async function main() {
     const args = process.argv.slice(2);
     let registry = null;
@@ -1155,6 +2249,7 @@ async function main() {
     let outputPath = process.cwd();
     let versionCount = 5;
     let dataMode = false;
+    let gcpCredentials = process.env.GCP_CREDENTIALS || null;
 
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help' || args[i] === '-h') {
@@ -1187,6 +2282,14 @@ async function main() {
             }
         } else if (args[i] === '--silent' || args[i] === '-s') {
             SILENT_MODE = true;
+        } else if (args[i] === '--gcp-credentials') {
+            if (i + 1 < args.length) {
+                gcpCredentials = args[i + 1];
+                i++;
+            } else {
+                console.log("Error: --gcp-credentials requires a path to service account JSON file");
+                process.exit(1);
+            }
         } else if (!registry) {
             // First positional argument is registry
             registry = args[i].toLowerCase();
@@ -1232,8 +2335,8 @@ async function main() {
             console.log(`Error: ${outputPath} is not a directory`);
             process.exit(1);
         }
-        
-        await downloadPyPIPackages(packageName, versionCount, outputPath);
+
+        await downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials);
         return;
     }
     
@@ -1259,12 +2362,15 @@ async function main() {
     log(`Requesting ${versionCount} version(s)`);
     log(`Output directory: ${outputPath}\n`);
 
+    const downloadedVersions = new Set();
+    const discoveredVersions = [];
+
     for (const registry of REGISTRIES) {
         log(`Checking ${registry}...`);
 
         const isTencent = registry.includes('tencent.com');
         const packageData = await getPackageInfo(registry, packageName, isTencent);
-        
+
         if (!packageData) {
             continue;
         }
@@ -1274,6 +2380,13 @@ async function main() {
         if (versions.length === 0) {
             log("  No versions found");
             continue;
+        }
+
+        // Track discovered versions for kmsec.uk fallback
+        for (const v of versions) {
+            if (!discoveredVersions.includes(v.version) && !isSecurityPlaceholderTarball(v.url)) {
+                discoveredVersions.push(v.version);
+            }
         }
 
         log(`  Found ${versions.length} version(s):`);
@@ -1287,7 +2400,12 @@ async function main() {
         for (const versionInfo of versions) {
             const { version, url: tarballUrl } = versionInfo;
 
-            if (tarballUrl.endsWith('0.0.1-security.tgz')) {
+            if (downloadedVersions.has(version)) {
+                log(`  Skipping ${version} (already downloaded)`);
+                continue;
+            }
+
+            if (isSecurityPlaceholderTarball(tarballUrl)) {
                 log(`Skipping security placeholder version: ${version}`);
                 continue;
             }
@@ -1295,20 +2413,35 @@ async function main() {
             const success = await downloadPackage(tarballUrl, packageName, version, outputPath, isTencent);
             if (success) {
                 successCount++;
+                downloadedVersions.add(version);
             }
         }
 
         if (successCount > 0) {
-            log(`\nSuccessfully downloaded ${successCount} version(s) from ${registry}`);
-            process.exit(0);
+            log(`\nDownloaded ${successCount} version(s) from ${registry}`);
         } else {
-            log(`\nFailed to download any versions from ${registry}\n`);
+            log(`\nNo new versions downloaded from ${registry}`);
         }
+
+        if (downloadedVersions.size > 0) {
+            log(`  ${downloadedVersions.size} unique version(s) downloaded so far\n`);
+        }
+    }
+
+    if (downloadedVersions.size > 0) {
+        log(`\nSuccessfully downloaded ${downloadedVersions.size} unique version(s) across all registries`);
+        process.exit(0);
     }
 
     // Try the npm view CLI method as a fallback
     const npmViewSuccess = await tryNpmViewMethod(packageName, versionCount, outputPath);
     if (npmViewSuccess) {
+        process.exit(0);
+    }
+
+    // Try kmsec.uk DPRK research archive as final fallback
+    const kmsecSuccess = await tryKmsecMethod(packageName, discoveredVersions, versionCount, outputPath);
+    if (kmsecSuccess) {
         process.exit(0);
     }
 

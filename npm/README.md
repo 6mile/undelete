@@ -20,7 +20,7 @@ which will tell you the NPM user, email and other metadata that's helpful for re
 When packages are removed from NPM or PyPI (often due to malware detection), they become unavailable through normal channels. This tool recovers those packages by:
 
 - **NPM**: Querying Chinese mirror servers (cnpmjs, npmmirror, Huawei, Tencent) that may still have cached copies
-- **PyPI**: Using [ecosyste.ms](https://ecosyste.ms) which indexes `files.pythonhosted.org` URLs that often remain accessible
+- **PyPI**: Using [ecosyste.ms](https://ecosyste.ms) which indexes `files.pythonhosted.org` URLs that often remain accessible. For deleted packages not in ecosyste.ms, a **BigQuery fallback** queries the PyPI public dataset to recover download URLs.
 
 This is particularly useful for security researchers analyzing malicious packages that have been taken down.
 
@@ -59,8 +59,11 @@ undelete <registry> <package-name> [options]
 | `-p, --path <directory>` | Save downloaded packages to specified directory (default: current directory) |
 | `-d, --data` | Get package metadata instead of downloading files |
 | `-s, --silent` | Silent mode - outputs JSON for `--data`, suppresses logs otherwise |
+| `--gcp-credentials <file>` | Path to GCP service account JSON for PyPI BigQuery fallback |
 | `-h, --help` | Display help message |
 | `-v, --version` | Show version |
+
+You can also set `GCP_CREDENTIALS` environment variable instead of using `--gcp-credentials`.
 
 ## Examples
 
@@ -81,6 +84,9 @@ undelete pypi requests
 
 # Download PyPI package with options
 undelete pypi flask -n 3 -p ./malware_samples
+
+# Download deleted PyPI package using BigQuery fallback
+undelete pypi tabletas --gcp-credentials ./service-account.json
 ```
 
 ### Getting Package Metadata
@@ -122,6 +128,37 @@ undelete pypi some-package --data -s
   "lastPublished": "2025-11-20T00:05:31.566Z",
   "isSecurityPlaceholder": true
 }
+```
+
+## BigQuery Fallback for PyPI
+
+PyPI never actually deletes files from object storage (`files.pythonhosted.org`). The BigQuery public dataset `bigquery-public-data.pypi.distribution_metadata` retains metadata for all packages, including deleted ones. This tool can query BigQuery to recover download URLs when ecosyste.ms doesn't have the package.
+
+### Setup
+
+1. Create a Google Cloud project (free tier available)
+2. Enable the BigQuery API
+3. Create a service account with BigQuery Job User role
+4. Download the service account JSON key file
+5. Pass via `--gcp-credentials` or set `GCP_CREDENTIALS` environment variable
+
+```bash
+# Create service account (one-time setup)
+gcloud iam service-accounts create bigquery-reader \
+  --display-name="BigQuery Reader"
+
+# Grant BigQuery access
+gcloud projects add-iam-policy-binding YOUR_PROJECT \
+  --member="serviceAccount:bigquery-reader@YOUR_PROJECT.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+
+# Download key
+gcloud iam service-accounts keys create ~/bigquery-credentials.json \
+  --iam-account=bigquery-reader@YOUR_PROJECT.iam.gserviceaccount.com
+
+# Use with undelete
+export GCP_CREDENTIALS=~/bigquery-credentials.json
+undelete pypi deleted-package
 ```
 
 ## License
