@@ -40,7 +40,7 @@ const ECOSYSTEMS_API = {
 
 const SUPPORTED_REGISTRIES = ['npm', 'pypi'];
 
-const VERSION = "1.5.0";
+const VERSION = "1.6.0";
 
 /**
  * Check if a tarball URL is a security placeholder
@@ -101,6 +101,9 @@ REGISTRIES:
 OPTIONS:
   -n, --number <count>      Number of versions to download (1-20, default: 5)
 
+  -t, --target-version <v>  Look up exactly this version (overrides -n).
+                            Errors and lists available versions if not found.
+
   -p, --path <directory>    Save downloaded packages to specified directory
                             (default: current directory)
 
@@ -125,6 +128,8 @@ EXAMPLES:
   undelete pypi requests
   undelete pypi numpy --data
   undelete pypi flask -n 3 -p ./downloads
+  undelete pypi elementary-data --target-version 0.23.3
+  undelete npm chalk -t 5.3.0 --data
 
 DESCRIPTION:
   Recovers packages that have been removed from NPM or PyPI registries.
@@ -1137,26 +1142,35 @@ function compareVersions(a, b) {
     return 0;
 }
 
-function getLastVersions(packageData, count) {
+function getLastVersions(packageData, count, targetVersion = null) {
     if (!packageData || !packageData.versions) {
         return [];
     }
 
     try {
-        const versions = Object.keys(packageData.versions);
-        versions.sort(compareVersions);
-        const selected = versions.slice(0, count);
-        
+        const allVersions = Object.keys(packageData.versions);
+
+        let selected;
+        if (targetVersion) {
+            if (!allVersions.includes(targetVersion)) {
+                return { notFound: true, available: allVersions };
+            }
+            selected = [targetVersion];
+        } else {
+            allVersions.sort(compareVersions);
+            selected = allVersions.slice(0, count);
+        }
+
         const versionInfo = [];
         for (const version of selected) {
             const versionData = packageData.versions[version];
             const tarballUrl = versionData && versionData.dist && versionData.dist.tarball;
-            
+
             if (tarballUrl) {
                 versionInfo.push({ version, url: tarballUrl });
             }
         }
-        
+
         return versionInfo;
     } catch (e) {
         log(`  Error parsing package data: ${e.message}`);
@@ -1283,18 +1297,19 @@ function performDownload(url, packageName, version, outputPath, redirectCount = 
     });
 }
 
-async function getPackageMetadata(registry, packageName, isTencent = false) {
+async function getPackageMetadata(registry, packageName, isTencent = false, targetVersion = null) {
     const maxAttempts = isTencent ? 10 : 1;
-    
+    const queryName = targetVersion ? `${packageName}@${targetVersion}` : packageName;
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             if (isTencent && attempt > 1) {
                 log(`  [Tencent] Retry attempt ${attempt}/${maxAttempts}...`);
             }
-            
+
             const registryUrl = registry.replace(/\/$/, '');
             const { stdout } = await execPromise(
-                `npm view ${packageName} --json --registry ${registryUrl} 2>/dev/null`,
+                `npm view ${queryName} --json --registry ${registryUrl} 2>/dev/null`,
                 { timeout: 30000 }
             );
             
@@ -1373,20 +1388,21 @@ function checkMissingFields(metadata) {
     return missing;
 }
 
-async function displayPackageData(packageName) {
+async function displayPackageData(packageName, targetVersion = null) {
     showBanner();
-    
-    log(`Fetching package metadata for: ${packageName}\n`);
-    
+
+    log(`Fetching package metadata for: ${packageName}${targetVersion ? `@${targetVersion}` : ''}\n`);
+
     let foundRegistry = null;
     let metadata = null;
     let isSecurityPlaceholder = false;
-    
+    const allDiscoveredVersions = new Set();
+
     for (const registry of REGISTRIES) {
         log(`Checking ${registry}...`);
-        
+
         const isTencent = registry.includes('tencent.com');
-        const registryMetadata = await getPackageMetadata(registry, packageName, isTencent);
+        const registryMetadata = await getPackageMetadata(registry, packageName, isTencent, targetVersion);
         
         if (!registryMetadata) {
             continue;
@@ -1442,6 +1458,23 @@ async function displayPackageData(packageName) {
     
     // If we still have no data at all
     if (!metadata && !normalizedEcosystems) {
+        if (targetVersion) {
+            // Try to fetch the full versions list so we can show what was actually available
+            for (const registry of REGISTRIES) {
+                const isTencent = registry.includes('tencent.com');
+                const fullData = await getPackageInfo(registry, packageName, isTencent);
+                if (fullData && fullData.versions) {
+                    for (const v of Object.keys(fullData.versions)) allDiscoveredVersions.add(v);
+                    break;
+                }
+            }
+            if (allDiscoveredVersions.size > 0) {
+                const sorted = Array.from(allDiscoveredVersions).sort(compareVersions);
+                log(`\nVersion ${targetVersion} not found for ${packageName}.`);
+                log(`Available versions: ${sorted.slice(0, 30).join(', ')}${sorted.length > 30 ? ` (+${sorted.length - 30} more)` : ''}`);
+                process.exit(1);
+            }
+        }
         log("\nFailed to retrieve package metadata from any source");
         process.exit(1);
     }
@@ -1623,10 +1656,10 @@ async function displayPackageData(packageName) {
  * Display PyPI package data (--data mode)
  * @param {string} packageName - The package name
  */
-async function displayPyPIPackageData(packageName) {
+async function displayPyPIPackageData(packageName, targetVersion = null) {
     showBanner();
 
-    log(`Fetching PyPI package metadata for: ${packageName}\n`);
+    log(`Fetching PyPI package metadata for: ${packageName}${targetVersion ? `@${targetVersion}` : ''}\n`);
     log(`Checking ecosyste.ms...`);
 
     const ecosystemsData = await getEcosystemsData(packageName, 'pypi');
@@ -1657,6 +1690,31 @@ async function displayPyPIPackageData(packageName) {
         process.exit(1);
     }
 
+    // If a target version was specified, verify it exists
+    if (targetVersion) {
+        let availableVersions = [];
+        const ecosystemsVersions = await fetchEcosystemsVersions(packageName, 'pypi');
+        if (Array.isArray(ecosystemsVersions)) {
+            availableVersions = ecosystemsVersions.map(v => v.number).filter(Boolean);
+        }
+        if (availableVersions.length === 0 && scrapedData && scrapedData.downloadUrls) {
+            const versionSet = new Set();
+            for (const file of scrapedData.downloadUrls) {
+                const m = file.filename && file.filename.match(/-(\d+\.\d+(?:\.\d+)?(?:[\w.-]*)?)(?:\.tar\.gz|\.whl|\.zip|-py)/);
+                if (m) versionSet.add(m[1]);
+            }
+            if (scrapedData.version) versionSet.add(scrapedData.version);
+            availableVersions = Array.from(versionSet);
+        }
+        if (!availableVersions.includes(targetVersion)) {
+            log(`\nVersion ${targetVersion} not found for ${packageName}.`);
+            if (availableVersions.length > 0) {
+                log(`Available versions: ${availableVersions.slice(0, 30).join(', ')}${availableVersions.length > 30 ? ` (+${availableVersions.length - 30} more)` : ''}`);
+            }
+            process.exit(1);
+        }
+    }
+
     // Output the data
     if (SILENT_MODE) {
         let jsonOutput;
@@ -1665,7 +1723,7 @@ async function displayPyPIPackageData(packageName) {
             // Use scraped data as primary source
             jsonOutput = {
                 package: packageName,
-                version: scrapedData.version,
+                version: targetVersion || scrapedData.version,
                 description: scrapedData.description,
                 maintainer: scrapedData.maintainer,
                 maintainerEmail: null,
@@ -1700,7 +1758,7 @@ async function displayPyPIPackageData(packageName) {
 
             jsonOutput = {
                 package: packageName,
-                version: normalizedEcosystems.latestVersion,
+                version: targetVersion || normalizedEcosystems.latestVersion,
                 description: normalizedEcosystems.description,
                 maintainer: primaryUser,
                 maintainerEmail: primaryEmail,
@@ -1729,7 +1787,7 @@ async function displayPyPIPackageData(packageName) {
     if (scrapedData && (!normalizedEcosystems || !normalizedEcosystems.latestVersion)) {
         // Display scraped data
         log(`\nPackage: ${packageName}`);
-        log(`Version: ${scrapedData.version || 'Unknown'}`);
+        log(`Version: ${targetVersion || scrapedData.version || 'Unknown'}`);
         if (scrapedData.description) {
             log(`Description: ${scrapedData.description}`);
         }
@@ -1755,7 +1813,7 @@ async function displayPyPIPackageData(packageName) {
     } else {
         // Display ecosyste.ms data
         log(`\nPackage: ${packageName}`);
-        log(`Version: ${normalizedEcosystems.latestVersion || 'Unknown'}`);
+        log(`Version: ${targetVersion || normalizedEcosystems.latestVersion || 'Unknown'}`);
         if (normalizedEcosystems.description) {
             log(`Description: ${normalizedEcosystems.description}`);
         }
@@ -1814,11 +1872,28 @@ async function displayPyPIPackageData(packageName) {
  * @param {string} outputPath - Directory to save files
  * @param {string|null} gcpCredentials - Optional path to GCP service account JSON for BigQuery fallback
  */
-async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials = null) {
+function pickPyPIVersions(versions, count, targetVersion, sourceLabel) {
+    if (targetVersion) {
+        const match = versions.find(v => v.number === targetVersion);
+        if (!match) {
+            const available = versions.map(v => v.number);
+            log(`  [${sourceLabel}] Version ${targetVersion} not found. Available: ${available.slice(0, 30).join(', ')}${available.length > 30 ? ` (+${available.length - 30} more)` : ''}`);
+            return [];
+        }
+        return [match];
+    }
+    return versions.slice(0, count);
+}
+
+async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials = null, targetVersion = null) {
     showBanner();
 
     log(`Searching for PyPI package: ${packageName}`);
-    log(`Requesting ${versionCount} version(s)`);
+    if (targetVersion) {
+        log(`Target version: ${targetVersion}`);
+    } else {
+        log(`Requesting ${versionCount} version(s)`);
+    }
     log(`Output directory: ${outputPath}\n`);
 
     log(`Checking ecosyste.ms for package versions...`);
@@ -1852,12 +1927,14 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
                 // Sort by version (semver-like) and take requested count
                 versions = Array.from(versionMap.values());
                 versions.sort((a, b) => compareVersions(a.number, b.number));
-                selectedVersions = versions.slice(0, versionCount);
-                usedBigQueryAsPrimary = true;
+                selectedVersions = pickPyPIVersions(versions, versionCount, targetVersion, 'BigQuery');
+                if (selectedVersions.length > 0) {
+                    usedBigQueryAsPrimary = true;
 
-                log(`  [BigQuery] Found ${versionMap.size} version(s), downloading ${selectedVersions.length}:`);
-                selectedVersions.forEach(v => log(`    - ${v.number}`));
-                log('');
+                    log(`  [BigQuery] Found ${versionMap.size} version(s), downloading ${selectedVersions.length}:`);
+                    selectedVersions.forEach(v => log(`    - ${v.number}`));
+                    log('');
+                }
             }
         }
 
@@ -1889,20 +1966,26 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
                 if (versionMap.size > 0) {
                     versions = Array.from(versionMap.values());
                     versions.sort((a, b) => compareVersions(a.number, b.number));
-                    selectedVersions = versions.slice(0, versionCount);
-                    usedWebScrapingAsPrimary = true;
+                    selectedVersions = pickPyPIVersions(versions, versionCount, targetVersion, 'pypi.org');
+                    if (selectedVersions.length > 0) {
+                        usedWebScrapingAsPrimary = true;
 
-                    if (scrapedData.isQuarantined) {
-                        log(`  ⚠️  Package is quarantined by PyPI administrators`);
+                        if (scrapedData.isQuarantined) {
+                            log(`  ⚠️  Package is quarantined by PyPI administrators`);
+                        }
+                        log(`  [pypi.org] Found ${versionMap.size} version(s), downloading ${selectedVersions.length}:`);
+                        selectedVersions.forEach(v => log(`    - ${v.number}`));
+                        log('');
                     }
-                    log(`  [pypi.org] Found ${versionMap.size} version(s), downloading ${selectedVersions.length}:`);
-                    selectedVersions.forEach(v => log(`    - ${v.number}`));
-                    log('');
                 }
             } else if (scrapedData && scrapedData.version) {
                 // We have version info but no download URLs on main page, try download page
-                log(`  Trying to fetch download page for version ${scrapedData.version}...`);
-                const downloadFiles = await scrapePyPIDownloadPage(packageName, scrapedData.version);
+                if (targetVersion && scrapedData.version !== targetVersion) {
+                    log(`  [pypi.org] Version ${targetVersion} not found. Available: ${scrapedData.version}`);
+                } else {
+                const versionToFetch = targetVersion || scrapedData.version;
+                log(`  Trying to fetch download page for version ${versionToFetch}...`);
+                const downloadFiles = await scrapePyPIDownloadPage(packageName, versionToFetch);
 
                 if (downloadFiles.length > 0) {
                     // Prefer .tar.gz files
@@ -1910,7 +1993,7 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
                     const selectedFile = tarGz || downloadFiles[0];
 
                     selectedVersions = [{
-                        number: scrapedData.version,
+                        number: versionToFetch,
                         download_url: selectedFile.url,
                         filename: selectedFile.filename
                     }];
@@ -1919,15 +2002,16 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
                     if (scrapedData.isQuarantined) {
                         log(`  ⚠️  Package is quarantined by PyPI administrators`);
                     }
-                    log(`  [pypi.org] Found download for version ${scrapedData.version}`);
+                    log(`  [pypi.org] Found download for version ${versionToFetch}`);
                     log('');
+                }
                 }
             }
         }
 
         // If still nothing found, exit with error
         if (selectedVersions.length === 0) {
-            log(`\nNo versions found for ${packageName}`);
+            log(`\nNo matching versions found for ${packageName}${targetVersion ? '@' + targetVersion : ''}`);
             if (!gcpCredentials) {
                 log(`Tip: Use --gcp-credentials to enable BigQuery fallback for deleted packages.\n`);
             }
@@ -1941,7 +2025,12 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
             return dateB - dateA;
         });
 
-        selectedVersions = versions.slice(0, versionCount);
+        selectedVersions = pickPyPIVersions(versions, versionCount, targetVersion, 'ecosyste.ms');
+
+        if (selectedVersions.length === 0) {
+            log(`\nNo matching versions found for ${packageName}${targetVersion ? '@' + targetVersion : ''}`);
+            process.exit(1);
+        }
 
         log(`  Found ${versions.length} total version(s), downloading ${selectedVersions.length}:`);
         selectedVersions.forEach(v => log(`    - ${v.number}`));
@@ -2027,31 +2116,41 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
 // NPM CLI Fallback Method
 // ==========================================
 
-async function tryNpmViewMethod(packageName, versionCount, outputPath) {
+async function tryNpmViewMethod(packageName, versionCount, outputPath, targetVersion = null) {
     log(`\nTrying npm view CLI method with Chinese mirrors...`);
-    
+
     for (const registry of NPM_VIEW_REGISTRIES) {
         log(`\nChecking ${registry} via npm view...`);
-        
+
         try {
-            const command = `npm view ${packageName} --json --registry ${registry}`;
-            const { stdout, stderr } = await execPromise(command, { 
+            const queryName = targetVersion ? `${packageName}@${targetVersion}` : packageName;
+            const command = `npm view ${queryName} --json --registry ${registry}`;
+            const { stdout, stderr } = await execPromise(command, {
                 timeout: 15000,
-                maxBuffer: 10 * 1024 * 1024 
+                maxBuffer: 10 * 1024 * 1024
             });
-            
+
             if (stderr && !stderr.includes('npm notice')) {
                 log(`  Warning: ${stderr.trim()}`);
             }
-            
+
             const data = JSON.parse(stdout);
-            
+
             // Handle both single version and multiple versions
             const versions = Array.isArray(data) ? data : [data];
-            
-            // Sort versions and take the requested count
-            versions.sort((a, b) => compareVersions(a.version, b.version));
-            const selectedVersions = versions.slice(0, versionCount);
+
+            let selectedVersions;
+            if (targetVersion) {
+                const match = versions.find(v => v.version === targetVersion);
+                if (!match) {
+                    log(`  Version ${targetVersion} not found via npm view`);
+                    continue;
+                }
+                selectedVersions = [match];
+            } else {
+                versions.sort((a, b) => compareVersions(a.version, b.version));
+                selectedVersions = versions.slice(0, versionCount);
+            }
             
             const validTarballs = [];
             for (const versionData of selectedVersions) {
@@ -2250,6 +2349,7 @@ async function main() {
     let versionCount = 5;
     let dataMode = false;
     let gcpCredentials = process.env.GCP_CREDENTIALS || null;
+    let targetVersion = null;
 
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help' || args[i] === '-h') {
@@ -2290,6 +2390,14 @@ async function main() {
                 console.log("Error: --gcp-credentials requires a path to service account JSON file");
                 process.exit(1);
             }
+        } else if (args[i] === '--target-version' || args[i] === '-t') {
+            if (i + 1 < args.length) {
+                targetVersion = args[i + 1];
+                i++;
+            } else {
+                console.log("Error: --target-version/-t requires a version string");
+                process.exit(1);
+            }
         } else if (!registry) {
             // First positional argument is registry
             registry = args[i].toLowerCase();
@@ -2322,10 +2430,10 @@ async function main() {
     // Route to appropriate handler based on registry
     if (registry === 'pypi') {
         if (dataMode) {
-            await displayPyPIPackageData(packageName);
+            await displayPyPIPackageData(packageName, targetVersion);
             return;
         }
-        
+
         if (!fs.existsSync(outputPath)) {
             console.log(`Error: Directory ${outputPath} does not exist`);
             process.exit(1);
@@ -2336,13 +2444,13 @@ async function main() {
             process.exit(1);
         }
 
-        await downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials);
+        await downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials, targetVersion);
         return;
     }
-    
+
     // NPM registry handling (default)
     if (dataMode) {
-        await displayPackageData(packageName);
+        await displayPackageData(packageName, targetVersion);
         return;
     }
 
@@ -2359,11 +2467,16 @@ async function main() {
     showBanner();
 
     log(`Searching for package: ${packageName}`);
-    log(`Requesting ${versionCount} version(s)`);
+    if (targetVersion) {
+        log(`Target version: ${targetVersion}`);
+    } else {
+        log(`Requesting ${versionCount} version(s)`);
+    }
     log(`Output directory: ${outputPath}\n`);
 
     const downloadedVersions = new Set();
     const discoveredVersions = [];
+    const allDiscoveredVersions = new Set();
 
     for (const registry of REGISTRIES) {
         log(`Checking ${registry}...`);
@@ -2375,7 +2488,15 @@ async function main() {
             continue;
         }
 
-        const versions = getLastVersions(packageData, versionCount);
+        const result = getLastVersions(packageData, versionCount, targetVersion);
+
+        if (result && result.notFound) {
+            for (const v of result.available) allDiscoveredVersions.add(v);
+            log(`  Version ${targetVersion} not found in this registry (${result.available.length} other version(s) available)`);
+            continue;
+        }
+
+        const versions = result;
 
         if (versions.length === 0) {
             log("  No versions found");
@@ -2434,15 +2555,23 @@ async function main() {
     }
 
     // Try the npm view CLI method as a fallback
-    const npmViewSuccess = await tryNpmViewMethod(packageName, versionCount, outputPath);
+    const npmViewSuccess = await tryNpmViewMethod(packageName, targetVersion ? 1 : versionCount, outputPath, targetVersion);
     if (npmViewSuccess) {
         process.exit(0);
     }
 
     // Try kmsec.uk DPRK research archive as final fallback
-    const kmsecSuccess = await tryKmsecMethod(packageName, discoveredVersions, versionCount, outputPath);
+    const kmsecVersionsToTry = targetVersion ? [targetVersion] : discoveredVersions;
+    const kmsecSuccess = await tryKmsecMethod(packageName, kmsecVersionsToTry, targetVersion ? 1 : versionCount, outputPath);
     if (kmsecSuccess) {
         process.exit(0);
+    }
+
+    if (targetVersion && allDiscoveredVersions.size > 0) {
+        const sorted = Array.from(allDiscoveredVersions).sort(compareVersions);
+        log(`\nVersion ${targetVersion} not found for ${packageName}.`);
+        log(`Available versions discovered: ${sorted.slice(0, 30).join(', ')}${sorted.length > 30 ? ` (+${sorted.length - 30} more)` : ''}`);
+        process.exit(1);
     }
 
     log("\nFailed to download packages from any registry or method");

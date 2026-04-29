@@ -1,6 +1,6 @@
 {
   "name": "undelete",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "undeletes packages that have been removed from the NPM (and PyPI!) registry",
   "keywords": [
     "undelete",

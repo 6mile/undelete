@@ -56,6 +56,7 @@ undelete <registry> <package-name> [options]
 | Option | Description |
 |--------|-------------|
 | `-n, --number <count>` | Number of versions to download (1-20, default: 5) |
+| `-t, --target-version <ver>` | Look up exactly this version (overrides `-n`). Errors and lists available versions if not found. |
 | `-p, --path <directory>` | Save downloaded packages to specified directory (default: current directory) |
 | `-d, --data` | Get package metadata instead of downloading files |
 | `-s, --silent` | Silent mode - outputs JSON for `--data`, suppresses logs otherwise |
@@ -87,6 +88,10 @@ undelete pypi flask -n 3 -p ./malware_samples
 
 # Download deleted PyPI package using BigQuery fallback
 undelete pypi tabletas --gcp-credentials ./service-account.json
+
+# Download a specific compromised version
+undelete pypi elementary-data --target-version 0.23.3
+undelete npm chalk -t 5.3.0
 ```
 
 ### Getting Package Metadata
