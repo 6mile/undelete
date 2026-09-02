@@ -30,17 +30,34 @@ const NPM_VIEW_REGISTRIES = [
 const KMSEC_API = "https://dprk-research.kmsec.uk/api/tarfiles/";
 const KMSEC_LISTING = "https://dprk-research.kmsec.uk/?json";
 
+// socket.dev: package pages are Cloudflare-protected, but raw file bodies are
+// served content-addressed and unauthenticated from socketusercontent.com/blob/<hash>.
+const SOCKET_BASE = "https://socket.dev";
+const SOCKET_BLOB_BASE = "https://socketusercontent.com/blob/";
+
 // Ecosyste.ms API endpoints for different registries
 const ECOSYSTEMS_API = {
     npm: "https://packages.ecosyste.ms/api/v1/registries/npmjs.org/packages/",
-    pypi: "https://packages.ecosyste.ms/api/v1/registries/pypi.org/packages/"
+    pypi: "https://packages.ecosyste.ms/api/v1/registries/pypi.org/packages/",
+    rubygems: "https://packages.ecosyste.ms/api/v1/registries/rubygems.org/packages/"
 };
 
 // BigQuery fallback for deleted PyPI packages (uses OAuth2 with service account)
 
-const SUPPORTED_REGISTRIES = ['npm', 'pypi'];
+// Full-mirror rubygems.org clones. TUNA runs a proper file mirror (not a CDN),
+// so yanked gems often survive there until the next sync. Ordered best-first.
+const GEM_MIRRORS = [
+    'https://mirrors.tuna.tsinghua.edu.cn/rubygems/gems/{name}-{version}.gem',
+    'https://mirrors.ustc.edu.cn/rubygems/gems/{name}-{version}.gem',
+    'https://mirrors.bfsu.edu.cn/rubygems/gems/{name}-{version}.gem',
+    'https://mirrors.aliyun.com/rubygems/gems/{name}-{version}.gem',
+    'https://repo.huaweicloud.com/repository/rubygems/gems/{name}-{version}.gem',
+    'https://gems.ruby-china.com/gems/{name}-{version}.gem'
+];
 
-const VERSION = "1.6.0";
+const SUPPORTED_REGISTRIES = ['npm', 'pypi', 'rubygems', 'gem'];
+
+const VERSION = "2.1.0";
 
 /**
  * Check if a tarball URL is a security placeholder
@@ -52,6 +69,10 @@ const VERSION = "1.6.0";
  */
 function isSecurityPlaceholderTarball(tarballUrl) {
     return /0\.0\.1-security(\.\d+)?\.tgz$/.test(tarballUrl);
+}
+
+function isSecurityPlaceholderVersion(version) {
+    return /^0\.0\.1-security(\.\d+)?$/.test(version);
 }
 
 let SILENT_MODE = false;
@@ -74,7 +95,7 @@ function showBanner() {
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  Package Recovery Tool v${VERSION}
- Supports: NPM, PyPI
+ Supports: NPM, PyPI, RubyGems
  Created by 6mile - github.com/6mile
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `);
@@ -97,6 +118,7 @@ USAGE:
 REGISTRIES:
   npm                       NPM (npmjs.org) packages
   pypi                      PyPI (pypi.org) Python packages
+  rubygems (or gem)         RubyGems (rubygems.org) Ruby packages
 
 OPTIONS:
   -n, --number <count>      Number of versions to download (1-20, default: 5)
@@ -114,6 +136,13 @@ OPTIONS:
   --gcp-credentials <file>  Path to GCP service account JSON file for PyPI
                             BigQuery fallback (also reads GCP_CREDENTIALS env var)
 
+  --socket                  Pull files from socket.dev (npm and rubygems).
+                            Skips all other sources. Requires puppeteer + Chrome;
+                            slower because Socket serves individual files, which
+                            are repackaged locally into <pkg>-<version>.tgz for
+                            npm or <pkg>-<version>-source.tar.gz for rubygems
+                            (not a valid .gem — the source files only).
+
   -h, --help                Display this help message
 
   -v, --version             Show the version of undelete
@@ -130,12 +159,25 @@ EXAMPLES:
   undelete pypi flask -n 3 -p ./downloads
   undelete pypi elementary-data --target-version 0.23.3
   undelete npm chalk -t 5.3.0 --data
+  undelete npm hexdrift --socket -n 1 -p ./downloads
+  undelete npm some-removed-pkg --socket -t 1.2.3
+
+  undelete rubygems rails
+  undelete gem sinatra -n 3 -p ./gems
+  undelete rubygems some-yanked-gem --socket
 
 DESCRIPTION:
-  Recovers packages that have been removed from NPM or PyPI registries.
+  Recovers packages that have been removed from NPM, PyPI, or RubyGems.
 
   For NPM: Uses Chinese mirror servers that may still have cached copies.
            Falls back to kmsec.uk DPRK research archive for malicious packages.
+           With --socket, pulls files from socket.dev (exclusive, no fallback
+           chain) and repackages them into a .tgz.
+  For RubyGems: Discovers versions via ecosyste.ms, then tries rubygems.org
+           directly (works for non-yanked gems), then Chinese full mirrors
+           (TUNA, USTC, BFSU, Aliyun, Huawei, Ruby China) which often retain
+           yanked gems until their next sync. With --socket, pulls source
+           files from socket.dev and packages them as a plain source tarball.
   For PyPI: Uses ecosyste.ms which indexes files.pythonhosted.org URLs.
            If ecosyste.ms has no data, falls back to:
            1. PyPI JSON API (for non-quarantined packages)
@@ -1235,7 +1277,7 @@ function performDownload(url, packageName, version, outputPath, redirectCount = 
         } else {
             // Try to extract filename from URL path
             const urlFilename = path.basename(parsedUrl.pathname);
-            if (urlFilename && (urlFilename.endsWith('.tgz') || urlFilename.endsWith('.tar.gz') || urlFilename.endsWith('.whl') || urlFilename.endsWith('.zip'))) {
+            if (urlFilename && (urlFilename.endsWith('.tgz') || urlFilename.endsWith('.tar.gz') || urlFilename.endsWith('.whl') || urlFilename.endsWith('.zip') || urlFilename.endsWith('.gem'))) {
                 filename = urlFilename;
             } else {
                 // Default to NPM-style naming
@@ -1872,7 +1914,7 @@ async function displayPyPIPackageData(packageName, targetVersion = null) {
  * @param {string} outputPath - Directory to save files
  * @param {string|null} gcpCredentials - Optional path to GCP service account JSON for BigQuery fallback
  */
-function pickPyPIVersions(versions, count, targetVersion, sourceLabel) {
+function pickVersions(versions, count, targetVersion, sourceLabel) {
     if (targetVersion) {
         const match = versions.find(v => v.number === targetVersion);
         if (!match) {
@@ -1927,7 +1969,7 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
                 // Sort by version (semver-like) and take requested count
                 versions = Array.from(versionMap.values());
                 versions.sort((a, b) => compareVersions(a.number, b.number));
-                selectedVersions = pickPyPIVersions(versions, versionCount, targetVersion, 'BigQuery');
+                selectedVersions = pickVersions(versions, versionCount, targetVersion, 'BigQuery');
                 if (selectedVersions.length > 0) {
                     usedBigQueryAsPrimary = true;
 
@@ -1966,7 +2008,7 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
                 if (versionMap.size > 0) {
                     versions = Array.from(versionMap.values());
                     versions.sort((a, b) => compareVersions(a.number, b.number));
-                    selectedVersions = pickPyPIVersions(versions, versionCount, targetVersion, 'pypi.org');
+                    selectedVersions = pickVersions(versions, versionCount, targetVersion, 'pypi.org');
                     if (selectedVersions.length > 0) {
                         usedWebScrapingAsPrimary = true;
 
@@ -2025,7 +2067,7 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
             return dateB - dateA;
         });
 
-        selectedVersions = pickPyPIVersions(versions, versionCount, targetVersion, 'ecosyste.ms');
+        selectedVersions = pickVersions(versions, versionCount, targetVersion, 'ecosyste.ms');
 
         if (selectedVersions.length === 0) {
             log(`\nNo matching versions found for ${packageName}${targetVersion ? '@' + targetVersion : ''}`);
@@ -2110,6 +2152,205 @@ async function downloadPyPIPackages(packageName, versionCount, outputPath, gcpCr
         log(`\nFailed to download any versions`);
         process.exit(1);
     }
+}
+
+// ==========================================
+// RubyGems download + data
+// ==========================================
+
+/**
+ * Try downloading a single .gem: primary URL first (usually the ecosyste.ms-
+ * supplied rubygems.org/downloads/... URL), then each Chinese mirror in order.
+ * @param {string} packageName
+ * @param {string} version
+ * @param {string|null} primaryUrl
+ * @param {string} outputPath
+ * @returns {Promise<{ok: boolean, source: string|null}>}
+ */
+async function downloadGemArtifact(packageName, version, primaryUrl, outputPath) {
+    const filename = `${packageName}-${version}.gem`;
+    const attempts = [];
+    if (primaryUrl) attempts.push({ url: primaryUrl, label: 'rubygems.org' });
+    for (const template of GEM_MIRRORS) {
+        const url = template
+            .replace('{name}', encodeURIComponent(packageName))
+            .replace('{version}', encodeURIComponent(version));
+        const host = new URL(url).host;
+        attempts.push({ url, label: host });
+    }
+
+    for (const { url, label } of attempts) {
+        try {
+            log(`  [${label}] Downloading ${filename}...`);
+            await performDownload(url, packageName, version, outputPath, 0, filename);
+            return { ok: true, source: label };
+        } catch (e) {
+            log(`    [${label}] ${e.message}`);
+        }
+    }
+
+    return { ok: false, source: null };
+}
+
+async function downloadRubygemsPackages(packageName, versionCount, outputPath, targetVersion = null) {
+    showBanner();
+
+    log(`Searching for RubyGems package: ${packageName}`);
+    if (targetVersion) {
+        log(`Target version: ${targetVersion}`);
+    } else {
+        log(`Requesting ${versionCount} version(s)`);
+    }
+    log(`Output directory: ${outputPath}\n`);
+
+    log(`Checking ecosyste.ms for package versions...`);
+    const versions = await fetchEcosystemsVersions(packageName, 'rubygems');
+
+    if (!versions || versions.length === 0) {
+        log(`\nNo versions found on ecosyste.ms for ${packageName}`);
+        process.exit(1);
+    }
+
+    versions.sort((a, b) => {
+        const dateA = new Date(a.published_at || 0);
+        const dateB = new Date(b.published_at || 0);
+        return dateB - dateA;
+    });
+
+    const selectedVersions = pickVersions(versions, versionCount, targetVersion, 'ecosyste.ms');
+
+    if (selectedVersions.length === 0) {
+        log(`\nNo matching versions found for ${packageName}${targetVersion ? '@' + targetVersion : ''}`);
+        process.exit(1);
+    }
+
+    log(`  Found ${versions.length} total version(s), downloading ${selectedVersions.length}:`);
+    selectedVersions.forEach(v => log(`    - ${v.number}${v.yanked ? ' (yanked)' : ''}`));
+    log('');
+
+    let successCount = 0;
+    let anyYankedMissed = false;
+
+    for (const v of selectedVersions) {
+        log(`\n=== ${packageName}@${v.number} ===`);
+        const primaryUrl = v.download_url || null;
+        const result = await downloadGemArtifact(packageName, v.number, primaryUrl, outputPath);
+        if (result.ok) {
+            successCount++;
+            log(`  Recovered via: ${result.source}`);
+        } else {
+            log(`  Failed to recover ${packageName}@${v.number} from any source`);
+            if (v.yanked) anyYankedMissed = true;
+        }
+    }
+
+    log('');
+    if (successCount > 0) {
+        log(`Successfully downloaded ${successCount}/${selectedVersions.length} version(s)`);
+        process.exit(0);
+    }
+
+    log(`Failed to download any versions from rubygems.org or Chinese mirrors`);
+    if (anyYankedMissed) {
+        log(`Tip: yanked gems may only be recoverable via --socket (source-file reconstruction from socket.dev)`);
+    }
+    process.exit(1);
+}
+
+async function displayRubygemsPackageData(packageName, targetVersion = null) {
+    showBanner();
+
+    log(`Fetching RubyGems package metadata for: ${packageName}${targetVersion ? `@${targetVersion}` : ''}\n`);
+    log(`Checking ecosyste.ms...`);
+
+    const ecosystemsData = await getEcosystemsData(packageName, 'rubygems');
+    const normalized = ecosystemsData ? normalizeEcosystemsData(ecosystemsData) : null;
+
+    if (!normalized) {
+        log("\nFailed to retrieve package metadata from ecosyste.ms");
+        process.exit(1);
+    }
+
+    log(`  [ecosyste.ms] Package data retrieved successfully`);
+
+    if (targetVersion) {
+        const versions = await fetchEcosystemsVersions(packageName, 'rubygems');
+        const available = Array.isArray(versions) ? versions.map(v => v.number).filter(Boolean) : [];
+        if (!available.includes(targetVersion)) {
+            log(`\nVersion ${targetVersion} not found for ${packageName}.`);
+            if (available.length > 0) {
+                log(`Available versions: ${available.slice(0, 30).join(', ')}${available.length > 30 ? ` (+${available.length - 30} more)` : ''}`);
+            }
+            process.exit(1);
+        }
+    }
+
+    const versionToShow = targetVersion || normalized.latestVersion;
+
+    if (SILENT_MODE) {
+        let maintainers = [];
+        let primaryUser = null;
+        let primaryEmail = null;
+        if (normalized.maintainers && normalized.maintainers.length > 0) {
+            maintainers = normalized.maintainers.map(m => ({ name: m.name || null, email: m.email || null }));
+            primaryUser = normalized.maintainers[0].name || null;
+            primaryEmail = normalized.maintainers[0].email || null;
+        }
+
+        const jsonOutput = {
+            package: packageName,
+            version: versionToShow,
+            description: normalized.description,
+            maintainer: primaryUser,
+            maintainerEmail: primaryEmail,
+            maintainers,
+            repository: normalized.repository,
+            license: normalized.license,
+            downloads: normalized.downloads,
+            dependentPackages: normalized.dependentPackages,
+            dependentRepos: normalized.dependentRepos,
+            firstPublished: normalized.firstPublished,
+            lastPublished: normalized.lastPublished,
+            source: 'ecosyste.ms',
+            registry: 'rubygems'
+        };
+        console.log(JSON.stringify(jsonOutput, null, 2));
+        process.exit(0);
+    }
+
+    log(`\nPackage: ${packageName}`);
+    log(`Version: ${versionToShow || 'Unknown'}`);
+    if (normalized.description) log(`Description: ${normalized.description}`);
+    log('');
+
+    if (normalized.downloads !== null && normalized.downloads !== undefined) {
+        log(`Downloads (last month): ${normalized.downloads.toLocaleString()}`);
+    }
+    if (normalized.license) log(`License: ${normalized.license}`);
+    if (normalized.repository) log(`Repository: ${normalized.repository}`);
+    if (normalized.dependentPackages !== null && normalized.dependentPackages !== undefined) {
+        log(`Dependent packages: ${normalized.dependentPackages.toLocaleString()}`);
+    }
+    if (normalized.dependentRepos !== null && normalized.dependentRepos !== undefined) {
+        log(`Dependent repos: ${normalized.dependentRepos.toLocaleString()}`);
+    }
+    if (normalized.firstPublished) log(`First published: ${normalized.firstPublished}`);
+    if (normalized.lastPublished) log(`Last published: ${normalized.lastPublished}`);
+
+    if (normalized.maintainers && normalized.maintainers.length > 0) {
+        log('');
+        log(`Maintainers:`);
+        normalized.maintainers.forEach((m, i) => {
+            log(`  ${i + 1}. ${m.name}`);
+            if (m.email) log(`     Email: ${m.email}`);
+            if (m.packagesCount) log(`     Packages: ${m.packagesCount}`);
+            if (m.htmlUrl) log(`     Profile: ${m.htmlUrl}`);
+        });
+    }
+
+    log('');
+    log(`Data from: ecosyste.ms (rubygems.org)`);
+    process.exit(0);
 }
 
 // ==========================================
@@ -2341,6 +2582,431 @@ async function tryKmsecMethod(packageName, knownVersions, versionCount, outputPa
     return false;
 }
 
+// ==========================================
+// socket.dev source (Puppeteer-only, npm)
+// ==========================================
+
+/**
+ * Launch a Puppeteer browser suitable for socket.dev (Cloudflare-protected).
+ * Reuses the same launch conventions as scrapePyPIWithPuppeteer.
+ * @returns {Promise<{browser: Object}>}
+ * @throws {Error} if puppeteer or a browser binary cannot be found
+ */
+async function launchSocketBrowser() {
+    const puppeteer = tryLoadPuppeteer();
+    if (!puppeteer) {
+        throw new Error("puppeteer is not installed. Install with: npm install -g puppeteer");
+    }
+
+    const launchOptions = {
+        headless: 'new',
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled'
+        ]
+    };
+
+    // Prefer puppeteer's bundled browser (guaranteed protocol match). Fall back to
+    // system Chrome only when puppeteer-core is installed instead.
+    if (puppeteer.executablePath && typeof puppeteer.executablePath === 'function') {
+        try {
+            launchOptions.executablePath = puppeteer.executablePath();
+        } catch (e) {}
+    }
+    if (!launchOptions.executablePath) {
+        const systemChrome = findChromePath();
+        if (systemChrome) launchOptions.executablePath = systemChrome;
+    }
+    if (!launchOptions.executablePath) {
+        throw new Error("No Chrome/Chromium found. Install Chrome or run: npm install -g puppeteer");
+    }
+
+    const browser = await puppeteer.launch(launchOptions);
+    return { browser };
+}
+
+/**
+ * Configure a page with a realistic UA and hide common automation fingerprints
+ * before navigating socket.dev (Cloudflare-protected).
+ * @param {Object} page - Puppeteer page
+ */
+async function prepareSocketPage(page) {
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"macOS"'
+    });
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.evaluateOnNewDocument(() => {
+        // Hide the automation signals Cloudflare fingerprints hardest.
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = window.chrome || { runtime: {} };
+        const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+        if (origQuery) {
+            window.navigator.permissions.query = (p) =>
+                p && p.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : origQuery(p);
+        }
+    });
+}
+
+/**
+ * Warm the browser session by loading socket.dev's root once so Cloudflare
+ * sets the __cf_bm cookie for the whole domain before we try deeper pages.
+ * @param {Object} page - Puppeteer page
+ */
+async function warmSocketSession(page) {
+    log(`  [socket.dev] Warming session at ${SOCKET_BASE}/ ...`);
+    try {
+        await page.goto(SOCKET_BASE + '/', { waitUntil: 'networkidle2', timeout: 45000 });
+        if (await isCloudflareChallenge(page)) {
+            await waitForCloudflareClear(page, 45000);
+        }
+    } catch (e) {
+        // Non-fatal — subsequent nav will retry the challenge with the same context.
+    }
+}
+
+/**
+ * Detect Cloudflare's "Just a moment..." challenge page.
+ * @param {Object} page - Puppeteer page
+ * @returns {Promise<boolean>}
+ */
+async function isCloudflareChallenge(page) {
+    try {
+        const title = await page.title();
+        return typeof title === 'string' && title.trim().toLowerCase().startsWith('just a moment');
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Wait up to `timeoutMs` for a Cloudflare managed challenge to resolve.
+ * Cloudflare typically clears the challenge on its own within a few seconds when
+ * the browser looks legitimate; we just have to sit still and let it happen.
+ * @param {Object} page - Puppeteer page
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>} - true if the challenge cleared
+ */
+async function waitForCloudflareClear(page, timeoutMs = 45000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        if (!(await isCloudflareChallenge(page))) return true;
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    return !(await isCloudflareChallenge(page));
+}
+
+/**
+ * Discover available versions on socket.dev for an npm package.
+ * @param {Object} page - Puppeteer page
+ * @param {string} packageName
+ * @returns {Promise<string[]>} - Versions sorted newest-first, with security placeholders removed
+ */
+async function discoverSocketVersions(page, packageName, socketRegistry = 'npm') {
+    const url = `${SOCKET_BASE}/${socketRegistry}/package/${packageName}/versions`;
+    log(`  [socket.dev] Fetching versions list: ${url}`);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+
+    if (await isCloudflareChallenge(page)) {
+        log(`  [socket.dev] Cloudflare challenge — waiting to clear...`);
+        if (!(await waitForCloudflareClear(page))) {
+            throw new Error("socket.dev Cloudflare challenge did not clear within 45s. Re-run the command; if it keeps happening, upgrade puppeteer: `npm install -g puppeteer@latest`.");
+        }
+    }
+
+    const versions = await page.evaluate((pkgName, registry) => {
+        const found = new Set();
+        // Anchor tags to /<registry>/package/<name>/overview/<v> or /files/<v> both encode the version.
+        const anchors = document.querySelectorAll('a[href]');
+        const prefixes = [
+            `/${registry}/package/${pkgName}/overview/`,
+            `/${registry}/package/${pkgName}/files/`
+        ];
+        for (const a of anchors) {
+            const href = a.getAttribute('href') || '';
+            for (const prefix of prefixes) {
+                if (href.startsWith(prefix)) {
+                    const rest = href.slice(prefix.length).split(/[/?#]/)[0];
+                    if (rest) found.add(decodeURIComponent(rest));
+                }
+            }
+        }
+        return Array.from(found);
+    }, packageName, socketRegistry);
+
+    const cleaned = versions.filter(v => v && !isSecurityPlaceholderVersion(v));
+    cleaned.sort(compareVersions);
+
+    if (cleaned.length === 0) {
+        log(`  [socket.dev] No versions parsed from versions page`);
+    } else {
+        log(`  [socket.dev] Found ${cleaned.length} version(s) on socket.dev`);
+    }
+    return cleaned;
+}
+
+/**
+ * Load the file tree for a package version from Socket's SSR JSON island.
+ * The __NEXT_DATA__ script embeds every file's relative path + content hash,
+ * which lets us fetch bodies directly from socketusercontent.com without
+ * further Puppeteer navigation.
+ * @param {Object} page - Puppeteer page (already past Cloudflare)
+ * @param {string} packageName
+ * @param {string} version
+ * @returns {Promise<Array<{path: string, hash: string, size: number}>>}
+ */
+async function discoverSocketFileTree(page, packageName, version, socketRegistry = 'npm') {
+    const url = `${SOCKET_BASE}/${socketRegistry}/package/${packageName}/files/${encodeURIComponent(version)}`;
+    log(`  [socket.dev] Loading file tree: ${url}`);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+
+    if (await isCloudflareChallenge(page)) {
+        log(`  [socket.dev] Cloudflare challenge — waiting to clear...`);
+        if (!(await waitForCloudflareClear(page))) {
+            throw new Error("socket.dev Cloudflare challenge did not clear within 45s");
+        }
+    }
+
+    const files = await page.evaluate(() => {
+        const el = document.getElementById('__NEXT_DATA__');
+        if (!el) return null;
+        try {
+            const data = JSON.parse(el.textContent || '{}');
+            const arr = data && data.props && data.props.pageProps && data.props.pageProps.files;
+            if (!Array.isArray(arr)) return null;
+            return arr
+                .filter(f => f && f.type === 'file' && typeof f.path === 'string' && typeof f.hash === 'string')
+                .map(f => ({ path: f.path, hash: f.hash, size: typeof f.size === 'number' ? f.size : 0 }));
+        } catch (e) {
+            return null;
+        }
+    });
+
+    if (!files || files.length === 0) {
+        log(`  [socket.dev] No files found in __NEXT_DATA__ for ${packageName}@${version}`);
+        return [];
+    }
+
+    log(`  [socket.dev] File tree: ${files.length} file(s)`);
+    return files;
+}
+
+/**
+ * Fetch a raw file body from socket.dev's content-addressed CDN.
+ * These URLs are public and not Cloudflare-protected — plain https.get works.
+ * @param {string} hash - Content hash from a file-tree entry
+ * @returns {Promise<Buffer>}
+ */
+function fetchSocketBlob(hash) {
+    const url = SOCKET_BLOB_BASE + encodeURIComponent(hash);
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, {
+            timeout: 30000,
+            headers: {
+                'User-Agent': 'undelete/' + VERSION,
+                'Accept': '*/*'
+            }
+        }, (res) => {
+            if (res.statusCode !== 200) {
+                res.resume();
+                return reject(new Error(`HTTP ${res.statusCode} for blob ${hash}`));
+            }
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', reject);
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error(`timeout fetching blob ${hash}`));
+        });
+    });
+}
+
+/**
+ * Package a fetched file tree into <pkg>-<version>.tgz using system tar.
+ * @param {string} packageName
+ * @param {string} version
+ * @param {Map<string,string>} files - relPath -> text content
+ * @param {string} outputPath - Destination directory for the tgz
+ * @returns {Promise<string>} - Absolute path of the created tgz
+ */
+async function writeAndPackageSocket(packageName, version, files, outputPath) {
+    const safeName = packageName.replace('/', '-');
+    const workRoot = path.join(outputPath, `.socket-work-${safeName}-${version}-${process.pid}`);
+    const packageDir = path.join(workRoot, 'package');
+    fs.mkdirSync(packageDir, { recursive: true });
+
+    try {
+        for (const [relPath, content] of files.entries()) {
+            const dest = path.join(packageDir, relPath);
+            const parent = path.dirname(dest);
+            const resolvedParent = path.resolve(parent);
+            const resolvedPackageDir = path.resolve(packageDir);
+            if (!resolvedParent.startsWith(resolvedPackageDir)) {
+                throw new Error(`Refusing to write outside package dir: ${relPath}`);
+            }
+            fs.mkdirSync(parent, { recursive: true });
+            fs.writeFileSync(dest, content);
+        }
+
+        const tgzPath = path.join(outputPath, `${safeName}-${version}.tgz`);
+        await execPromise(`tar -czf "${tgzPath}" -C "${workRoot}" package`);
+        return tgzPath;
+    } finally {
+        try {
+            fs.rmSync(workRoot, { recursive: true, force: true });
+        } catch (e) {
+            log(`  [socket.dev] Warning: failed to remove work dir ${workRoot}: ${e.message}`);
+        }
+    }
+}
+
+/**
+ * Package fetched files into <name>-<version>-source.tar.gz for rubygems.
+ * Uses a <name>-<version>/ prefix rather than package/ so the archive extracts
+ * into a clearly-named directory. Output is NOT a valid .gem — the -source
+ * suffix and .tar.gz extension make that obvious.
+ */
+async function writeAndPackageSocketGem(packageName, version, files, outputPath) {
+    const safeName = packageName.replace('/', '-');
+    const workRoot = path.join(outputPath, `.socket-work-${safeName}-${version}-${process.pid}`);
+    const dirName = `${safeName}-${version}`;
+    const packageDir = path.join(workRoot, dirName);
+    fs.mkdirSync(packageDir, { recursive: true });
+
+    try {
+        for (const [relPath, content] of files.entries()) {
+            const dest = path.join(packageDir, relPath);
+            const parent = path.dirname(dest);
+            const resolvedParent = path.resolve(parent);
+            const resolvedPackageDir = path.resolve(packageDir);
+            if (!resolvedParent.startsWith(resolvedPackageDir)) {
+                throw new Error(`Refusing to write outside package dir: ${relPath}`);
+            }
+            fs.mkdirSync(parent, { recursive: true });
+            fs.writeFileSync(dest, content);
+        }
+
+        const tgzPath = path.join(outputPath, `${safeName}-${version}-source.tar.gz`);
+        await execPromise(`tar -czf "${tgzPath}" -C "${workRoot}" "${dirName}"`);
+        return tgzPath;
+    } finally {
+        try {
+            fs.rmSync(workRoot, { recursive: true, force: true });
+        } catch (e) {
+            log(`  [socket.dev] Warning: failed to remove work dir ${workRoot}: ${e.message}`);
+        }
+    }
+}
+
+/**
+ * Orchestrate the socket.dev download flow for a single package.
+ * @param {string} packageName
+ * @param {number} versionCount
+ * @param {string|null} targetVersion
+ * @param {string} outputPath
+ * @param {string} socketRegistry - 'npm' or 'rubygems'
+ * @returns {Promise<{downloaded: string[], notFound: string[], available: string[]}>}
+ */
+async function trySocketMethod(packageName, versionCount, targetVersion, outputPath, socketRegistry = 'npm') {
+    log(`\nTrying socket.dev (${socketRegistry})...`);
+
+    try {
+        await execPromise('tar --version');
+    } catch (e) {
+        throw new Error("system 'tar' not found on PATH — required to package socket.dev files");
+    }
+
+    const { browser } = await launchSocketBrowser();
+    const downloaded = [];
+    const notFound = [];
+    let availableVersions = [];
+
+    try {
+        const page = await browser.newPage();
+        await prepareSocketPage(page);
+        await warmSocketSession(page);
+
+        availableVersions = await discoverSocketVersions(page, packageName, socketRegistry);
+
+        let versionsToFetch;
+        if (targetVersion) {
+            if (!availableVersions.includes(targetVersion)) {
+                return { downloaded, notFound: [targetVersion], available: availableVersions };
+            }
+            versionsToFetch = [targetVersion];
+        } else {
+            versionsToFetch = availableVersions.slice(0, versionCount);
+        }
+
+        if (versionsToFetch.length === 0) {
+            log(`  [socket.dev] No usable versions to fetch`);
+            return { downloaded, notFound, available: availableVersions };
+        }
+
+        log(`  [socket.dev] Fetching ${versionsToFetch.length} version(s): ${versionsToFetch.join(', ')}`);
+
+        for (const version of versionsToFetch) {
+            log(`\n  [socket.dev] === ${packageName}@${version} ===`);
+            const fileEntries = await discoverSocketFileTree(page, packageName, version, socketRegistry);
+            if (fileEntries.length === 0) {
+                log(`  [socket.dev] No files found for ${version}, skipping`);
+                notFound.push(version);
+                continue;
+            }
+
+            const files = new Map();
+            let failed = 0;
+            const CONCURRENCY = 8;
+            let cursor = 0;
+            const total = fileEntries.length;
+
+            async function worker() {
+                while (true) {
+                    const idx = cursor++;
+                    if (idx >= total) return;
+                    const entry = fileEntries[idx];
+                    log(`  [socket.dev] (${idx + 1}/${total}) ${entry.path} (${entry.size} bytes)`);
+                    try {
+                        const buf = await fetchSocketBlob(entry.hash);
+                        files.set(entry.path, buf);
+                    } catch (e) {
+                        failed++;
+                        log(`    [socket.dev] failed: ${e.message}`);
+                    }
+                }
+            }
+            await Promise.all(Array.from({ length: Math.min(CONCURRENCY, total) }, worker));
+
+            if (files.size === 0) {
+                log(`  [socket.dev] No file contents captured for ${version}`);
+                notFound.push(version);
+                continue;
+            }
+
+            const packager = socketRegistry === 'rubygems' ? writeAndPackageSocketGem : writeAndPackageSocket;
+            const outPath = await packager(packageName, version, files, outputPath);
+            downloaded.push(outPath);
+            log(`  [socket.dev] Wrote ${outPath} (${files.size} file(s), ${failed} failed)`);
+        }
+    } finally {
+        try { await browser.close(); } catch (e) {}
+    }
+
+    return { downloaded, notFound, available: availableVersions };
+}
+
 async function main() {
     const args = process.argv.slice(2);
     let registry = null;
@@ -2350,6 +3016,7 @@ async function main() {
     let dataMode = false;
     let gcpCredentials = process.env.GCP_CREDENTIALS || null;
     let targetVersion = null;
+    let socketMode = false;
 
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--help' || args[i] === '-h') {
@@ -2398,6 +3065,8 @@ async function main() {
                 console.log("Error: --target-version/-t requires a version string");
                 process.exit(1);
             }
+        } else if (args[i] === '--socket') {
+            socketMode = true;
         } else if (!registry) {
             // First positional argument is registry
             registry = args[i].toLowerCase();
@@ -2421,10 +3090,74 @@ async function main() {
         process.exit(1);
     }
 
+    // Normalize aliases so downstream code only sees canonical names.
+    if (registry === 'gem') registry = 'rubygems';
+
     if (!packageName) {
         console.log("Usage: undelete <registry> <package-name> [options]");
         console.log("Try 'undelete --help' for more information.");
         process.exit(1);
+    }
+
+    // --socket guards
+    if (socketMode) {
+        if (registry !== 'npm' && registry !== 'rubygems') {
+            console.log("Error: --socket supports npm and rubygems in this release");
+            process.exit(1);
+        }
+        if (dataMode) {
+            console.log("Error: --socket cannot be combined with --data (socket.dev has no metadata endpoint)");
+            process.exit(1);
+        }
+    }
+
+    // socket.dev exclusive mode — skips the normal fallback chain. Registry-agnostic.
+    if (socketMode) {
+        if (!fs.existsSync(outputPath)) {
+            console.log(`Error: Directory ${outputPath} does not exist`);
+            process.exit(1);
+        }
+        if (!fs.statSync(outputPath).isDirectory()) {
+            console.log(`Error: ${outputPath} is not a directory`);
+            process.exit(1);
+        }
+
+        showBanner();
+        log(`Searching for ${registry} package: ${packageName}`);
+        if (targetVersion) {
+            log(`Target version: ${targetVersion}`);
+        } else {
+            log(`Requesting ${versionCount} version(s)`);
+        }
+        log(`Output directory: ${outputPath}\n`);
+
+        try {
+            const result = await trySocketMethod(
+                packageName,
+                targetVersion ? 1 : versionCount,
+                targetVersion,
+                outputPath,
+                registry
+            );
+
+            if (result.downloaded.length > 0) {
+                log(`\nSuccessfully downloaded ${result.downloaded.length} version(s) from socket.dev`);
+                process.exit(0);
+            }
+
+            if (targetVersion && result.available.length > 0) {
+                const sorted = result.available.slice().sort(compareVersions);
+                log(`\nVersion ${targetVersion} not found on socket.dev for ${packageName}.`);
+                log(`Available versions on socket.dev: ${sorted.slice(0, 30).join(', ')}${sorted.length > 30 ? ` (+${sorted.length - 30} more)` : ''}`);
+                process.exit(1);
+            }
+
+            log(`\nFailed to download any versions from socket.dev`);
+            process.exit(1);
+        } catch (err) {
+            console.error(`socket.dev error: ${err.message}`);
+            process.exit(1);
+        }
     }
 
     // Route to appropriate handler based on registry
@@ -2445,6 +3178,26 @@ async function main() {
         }
 
         await downloadPyPIPackages(packageName, versionCount, outputPath, gcpCredentials, targetVersion);
+        return;
+    }
+
+    if (registry === 'rubygems') {
+        if (dataMode) {
+            await displayRubygemsPackageData(packageName, targetVersion);
+            return;
+        }
+
+        if (!fs.existsSync(outputPath)) {
+            console.log(`Error: Directory ${outputPath} does not exist`);
+            process.exit(1);
+        }
+
+        if (!fs.statSync(outputPath).isDirectory()) {
+            console.log(`Error: ${outputPath} is not a directory`);
+            process.exit(1);
+        }
+
+        await downloadRubygemsPackages(packageName, versionCount, outputPath, targetVersion);
         return;
     }
 

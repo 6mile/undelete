@@ -1,11 +1,12 @@
 {
   "name": "undelete",
-  "version": "1.6.0",
-  "description": "undeletes packages that have been removed from the NPM (and PyPI!) registry",
+  "version": "2.1.0",
+  "description": "undeletes packages that have been removed from the NPM, PyPI, and RubyGems registries",
   "keywords": [
     "undelete",
     "npm",
     "pypi",
+    "rubygems",
     "security",
     "malware",
     "quarantine"

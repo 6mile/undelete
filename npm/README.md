@@ -17,10 +17,12 @@ which will tell you the NPM user, email and other metadata that's helpful for re
 
 ## Overview
 
-When packages are removed from NPM or PyPI (often due to malware detection), they become unavailable through normal channels. This tool recovers those packages by:
+When packages are removed from NPM, PyPI, or RubyGems (often due to malware detection), they become unavailable through normal channels. This tool recovers those packages by:
 
 - **NPM**: Querying Chinese mirror servers (cnpmjs, npmmirror, Huawei, Tencent) that may still have cached copies
 - **PyPI**: Using [ecosyste.ms](https://ecosyste.ms) which indexes `files.pythonhosted.org` URLs that often remain accessible. For deleted packages not in ecosyste.ms, a **BigQuery fallback** queries the PyPI public dataset to recover download URLs.
+- **RubyGems**: Discovering versions via [ecosyste.ms](https://ecosyste.ms), then trying rubygems.org directly (works for non-yanked gems), then Chinese full mirrors (TUNA, USTC, BFSU, Aliyun, Huawei, Ruby China) which often retain yanked gems until their next sync.
+- **socket.dev fallback** (`--socket`, npm and rubygems): Pulls source files directly from socket.dev's file browser using a headless Chrome. For npm the files are repackaged into a valid `.tgz`; for rubygems they land as a source `.tar.gz` (not an installable `.gem`).
 
 This is particularly useful for security researchers analyzing malicious packages that have been taken down.
 
@@ -50,6 +52,7 @@ undelete <registry> <package-name> [options]
 |----------|-------------|
 | `npm` | NPM (npmjs.org) packages |
 | `pypi` | PyPI (pypi.org) Python packages |
+| `rubygems` (or `gem`) | RubyGems (rubygems.org) Ruby packages |
 
 ### Options
 
@@ -61,6 +64,7 @@ undelete <registry> <package-name> [options]
 | `-d, --data` | Get package metadata instead of downloading files |
 | `-s, --silent` | Silent mode - outputs JSON for `--data`, suppresses logs otherwise |
 | `--gcp-credentials <file>` | Path to GCP service account JSON for PyPI BigQuery fallback |
+| `--socket` | Pull files from socket.dev (npm and rubygems). Skips other sources. Requires puppeteer + Chrome. |
 | `-h, --help` | Display help message |
 | `-v, --version` | Show version |
 
@@ -92,6 +96,14 @@ undelete pypi tabletas --gcp-credentials ./service-account.json
 # Download a specific compromised version
 undelete pypi elementary-data --target-version 0.23.3
 undelete npm chalk -t 5.3.0
+
+# RubyGems: recover latest and specific versions
+undelete rubygems rails
+undelete gem sinatra -n 3 -p ./gems
+undelete rubygems some-gem --target-version 1.2.3
+
+# RubyGems: recover yanked gem via socket.dev (writes <name>-<version>-source.tar.gz)
+undelete rubygems some-yanked-gem --socket
 ```
 
 ### Getting Package Metadata
@@ -107,6 +119,10 @@ undelete npm mayhem-wma --data --silent
 
 # PyPI metadata
 undelete pypi some-package --data -s
+
+# RubyGems metadata
+undelete rubygems rails --data
+undelete gem sinatra --data --silent
 ```
 
 ### Example JSON Output
