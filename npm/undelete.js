@@ -819,15 +819,18 @@ async function scrapePyPIWithPuppeteer(packageName) {
 
         // If using puppeteer-core, we need to specify executablePath
         if (puppeteer.executablePath && typeof puppeteer.executablePath === 'function') {
-            // Full puppeteer - has bundled browser
+            // Full puppeteer - has bundled browser. Newer versions return a Promise.
             try {
-                launchOptions.executablePath = puppeteer.executablePath();
-            } catch (e) {
-                // May not have bundled browser, try to find system Chrome
-                const chromePath = findChromePath();
-                if (chromePath) {
-                    launchOptions.executablePath = chromePath;
+                const resolved = await Promise.resolve(puppeteer.executablePath());
+                if (resolved && fs.existsSync(resolved)) {
+                    launchOptions.executablePath = resolved;
+                } else {
+                    const chromePath = findChromePath();
+                    if (chromePath) launchOptions.executablePath = chromePath;
                 }
+            } catch (e) {
+                const chromePath = findChromePath();
+                if (chromePath) launchOptions.executablePath = chromePath;
             }
         } else {
             // puppeteer-core - needs system Chrome
@@ -2609,10 +2612,14 @@ async function launchSocketBrowser() {
     };
 
     // Prefer puppeteer's bundled browser (guaranteed protocol match). Fall back to
-    // system Chrome only when puppeteer-core is installed instead.
+    // system Chrome only when puppeteer-core is installed instead. Newer puppeteer
+    // versions return a Promise from executablePath(); older ones return a string.
     if (puppeteer.executablePath && typeof puppeteer.executablePath === 'function') {
         try {
-            launchOptions.executablePath = puppeteer.executablePath();
+            const resolved = await Promise.resolve(puppeteer.executablePath());
+            if (resolved && fs.existsSync(resolved)) {
+                launchOptions.executablePath = resolved;
+            }
         } catch (e) {}
     }
     if (!launchOptions.executablePath) {
@@ -2620,7 +2627,7 @@ async function launchSocketBrowser() {
         if (systemChrome) launchOptions.executablePath = systemChrome;
     }
     if (!launchOptions.executablePath) {
-        throw new Error("No Chrome/Chromium found. Install Chrome or run: npm install -g puppeteer");
+        throw new Error("No Chrome/Chromium found. Install Chrome, run `npx puppeteer browsers install chrome`, or set PUPPETEER_EXECUTABLE_PATH.");
     }
 
     const browser = await puppeteer.launch(launchOptions);
