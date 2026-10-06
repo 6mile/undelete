@@ -467,7 +467,7 @@ async function fetchPyPIUrlsFromBigQuery(packageName, credentialsPath) {
 
     return new Promise((resolve) => {
         const query = `
-            SELECT name, version, path, filename
+            SELECT name, version, path, filename, sha256_digest
             FROM \`bigquery-public-data.pypi.distribution_metadata\`
             WHERE LOWER(name) = LOWER(@pkg)
         `;
@@ -517,17 +517,19 @@ async function fetchPyPIUrlsFromBigQuery(packageName, credentialsPath) {
                     }
 
                     // Parse the results
-                    // Schema: name (f[0]), version (f[1]), path (f[2]), filename (f[3])
+                    // Schema: name (f[0]), version (f[1]), path (f[2]), filename (f[3]), sha256_digest (f[4])
                     const results = parsed.rows.map(row => {
                         const version = row.f[1].v;
                         const pathValue = row.f[2].v;
                         const filename = row.f[3].v;
+                        const sha256 = row.f[4] && row.f[4].v ? row.f[4].v : null;
 
                         // Construct the full URL from the path
                         // path format: xx/yy/hash/filename
                         const url = `https://files.pythonhosted.org/packages/${pathValue}`;
 
-                        return { version, url, filename };
+                        // Known-good hash from BigQuery, used to verify integrity after download
+                        return { version, url, filename, sha256 };
                     });
 
                     log(`  [BigQuery] Found ${results.length} file(s)`);
