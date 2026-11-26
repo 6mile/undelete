@@ -2783,27 +2783,54 @@ async function discoverSocketFileTree(page, packageName, version, socketRegistry
         }
     }
 
-    const files = await page.evaluate(() => {
+    const result = await page.evaluate(() => {
         const el = document.getElementById('__NEXT_DATA__');
         if (!el) return null;
         try {
             const data = JSON.parse(el.textContent || '{}');
-            const arr = data && data.props && data.props.pageProps && data.props.pageProps.files;
-            if (!Array.isArray(arr)) return null;
-            return arr
-                .filter(f => f && f.type === 'file' && typeof f.path === 'string' && typeof f.hash === 'string')
-                .map(f => ({ path: f.path, hash: f.hash, size: typeof f.size === 'number' ? f.size : 0 }));
+            const root = data && data.props && data.props.pageProps && data.props.pageProps.files;
+            if (!Array.isArray(root)) return null;
+
+            // Socket's file tree can be nested: directory entries carry a
+            // `children` array of further entries. Walk recursively so we
+            // don't silently drop everything below the top level.
+            const files = [];
+            let totalEntries = 0;
+            let skippedNoHash = 0;
+            let skippedNoPath = 0;
+
+            const walk = (entries) => {
+                for (const f of entries) {
+                    if (!f || typeof f !== 'object') continue;
+                    totalEntries++;
+                    if (Array.isArray(f.children) && f.children.length > 0) {
+                        walk(f.children);
+                        continue;
+                    }
+                    if (typeof f.path !== 'string') { skippedNoPath++; continue; }
+                    if (typeof f.hash !== 'string') { skippedNoHash++; continue; }
+                    files.push({
+                        path: f.path,
+                        hash: f.hash,
+                        size: typeof f.size === 'number' ? f.size : 0
+                    });
+                }
+            };
+            walk(root);
+
+            return { files, totalEntries, skippedNoHash, skippedNoPath };
         } catch (e) {
             return null;
         }
     });
 
-    if (!files || files.length === 0) {
+    if (!result || result.files.length === 0) {
         log(`  [socket.dev] No files found in __NEXT_DATA__ for ${packageName}@${version}`);
         return [];
     }
 
-    log(`  [socket.dev] File tree: ${files.length} file(s)`);
+    const { files, totalEntries, skippedNoHash, skippedNoPath } = result;
+    log(`  [socket.dev] File tree: ${files.length} file(s) (walked ${totalEntries} entries${skippedNoHash ? `, skipped ${skippedNoHash} without hash` : ''}${skippedNoPath ? `, skipped ${skippedNoPath} without path` : ''})`);
     return files;
 }
 
