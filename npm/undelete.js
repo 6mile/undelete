@@ -33,7 +33,12 @@ const KMSEC_LISTING = "https://dprk-research.kmsec.uk/?json";
 // socket.dev: package pages are Cloudflare-protected, but raw file bodies are
 // served content-addressed and unauthenticated from socketusercontent.com/blob/<hash>.
 const SOCKET_BASE = "https://socket.dev";
+// Socket serves file bodies from two endpoints depending on storage class.
+// Small files (roughly < 85 KB) live under /blob/<hash>. Larger files use a
+// different storage path at /file/<hash> and their hash in __NEXT_DATA__ carries
+// a leading `S` to signal it. The content is unauthenticated on both.
 const SOCKET_BLOB_BASE = "https://socketusercontent.com/blob/";
+const SOCKET_FILE_BASE = "https://socketusercontent.com/file/";
 
 // Ecosyste.ms API endpoints for different registries
 const ECOSYSTEMS_API = {
@@ -2859,7 +2864,10 @@ async function discoverSocketFileTree(page, packageName, version, socketRegistry
  * @returns {Promise<Buffer>}
  */
 function fetchSocketBlob(hash) {
-    const url = SOCKET_BLOB_BASE + encodeURIComponent(hash);
+    // S-prefixed hashes belong to the /file/ storage class; everything else
+    // comes from /blob/. Hitting the wrong endpoint returns HTTP 400.
+    const base = hash && hash[0] === 'S' ? SOCKET_FILE_BASE : SOCKET_BLOB_BASE;
+    const url = base + encodeURIComponent(hash);
     return new Promise((resolve, reject) => {
         const req = https.get(url, {
             timeout: 30000,
@@ -3035,7 +3043,7 @@ async function trySocketMethod(packageName, versionCount, targetVersion, outputP
                         files.set(entry.path, buf);
                     } catch (e) {
                         failed++;
-                        log(`    [socket.dev] failed: ${e.message}`);
+                        log(`    [socket.dev] failed ${entry.path} (${entry.size} bytes): ${e.message}`);
                         if (process.env.UNDELETE_DEBUG_SOCKET && entry.raw) {
                             try {
                                 log(`    [socket.dev] DEBUG raw entry: ${JSON.stringify(entry.raw)}`);
