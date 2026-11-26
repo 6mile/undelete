@@ -2789,7 +2789,7 @@ async function discoverSocketFileTree(page, packageName, version, socketRegistry
         try {
             const data = JSON.parse(el.textContent || '{}');
             const root = data && data.props && data.props.pageProps && data.props.pageProps.files;
-            if (!Array.isArray(root)) return null;
+            if (!Array.isArray(root)) return { rawPageProps: data && data.props && data.props.pageProps };
 
             // Socket's file tree can be nested: directory entries carry a
             // `children` array of further entries. Walk recursively so we
@@ -2809,20 +2809,38 @@ async function discoverSocketFileTree(page, packageName, version, socketRegistry
                     }
                     if (typeof f.path !== 'string') { skippedNoPath++; continue; }
                     if (typeof f.hash !== 'string') { skippedNoHash++; continue; }
+                    // Preserve the full raw entry so the caller can diagnose
+                    // blob endpoints that reject certain hashes.
                     files.push({
                         path: f.path,
                         hash: f.hash,
-                        size: typeof f.size === 'number' ? f.size : 0
+                        size: typeof f.size === 'number' ? f.size : 0,
+                        raw: f
                     });
                 }
             };
             walk(root);
 
-            return { files, totalEntries, skippedNoHash, skippedNoPath };
+            const debugRaw = data && data.props && data.props.pageProps;
+            return { files, totalEntries, skippedNoHash, skippedNoPath, rawPageProps: debugRaw };
         } catch (e) {
             return null;
         }
     });
+
+    // Optional debug dump: set UNDELETE_DEBUG_SOCKET=1 to persist the raw
+    // pageProps for inspection. Used to compare hash schemas for entries
+    // the blob CDN rejects.
+    if (process.env.UNDELETE_DEBUG_SOCKET && result && result.rawPageProps) {
+        try {
+            const safe = packageName.replace(/[^A-Za-z0-9_.-]/g, '_');
+            const dumpPath = path.join(process.cwd(), `socket-debug-${safe}-${version}.json`);
+            fs.writeFileSync(dumpPath, JSON.stringify(result.rawPageProps, null, 2));
+            log(`  [socket.dev] DEBUG wrote raw pageProps to ${dumpPath}`);
+        } catch (e) {
+            log(`  [socket.dev] DEBUG dump failed: ${e.message}`);
+        }
+    }
 
     if (!result || result.files.length === 0) {
         log(`  [socket.dev] No files found in __NEXT_DATA__ for ${packageName}@${version}`);
@@ -3018,6 +3036,11 @@ async function trySocketMethod(packageName, versionCount, targetVersion, outputP
                     } catch (e) {
                         failed++;
                         log(`    [socket.dev] failed: ${e.message}`);
+                        if (process.env.UNDELETE_DEBUG_SOCKET && entry.raw) {
+                            try {
+                                log(`    [socket.dev] DEBUG raw entry: ${JSON.stringify(entry.raw)}`);
+                            } catch (err) {}
+                        }
                     }
                 }
             }
